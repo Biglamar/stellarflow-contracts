@@ -3,6 +3,8 @@
 use soroban_sdk::token::TokenClient;
 use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, Address, Env};
 
+pub mod tick_bitmap;
+
 /// Compute the high 128 bits of the full 256-bit product `a * b`.
 ///
 /// This is used alongside `wrapping_mul` (which yields the low 128 bits) to
@@ -51,6 +53,16 @@ pub enum AmmError {
     PoolEmpty = 6,
     /// Constant-product invariant violated: k_new < k_old after a swap.
     InvariantViolation = 7,
+    /// Tick spacing must be in `1..=MAX_TICK_SPACING`.
+    InvalidTickSpacing = 8,
+    /// Tick lies outside `[MIN_TICK, MAX_TICK]`.
+    TickOutOfBounds = 9,
+    /// Tick is not a multiple of the tick spacing.
+    TickNotAligned = 10,
+    /// Price lies outside `[P(MIN_TICK), P(MAX_TICK)]`.
+    PriceOutOfBounds = 11,
+    /// Price does not satisfy `P(tick) <= price < P(tick + 1)`, `P(i) = 1.0001^i`.
+    TickPriceMismatch = 12,
 }
 
 #[contract]
@@ -313,6 +325,23 @@ impl AmmContract {
             .get(&symbol_short!("tot_sh"))
             .unwrap_or(0)
     }
+
+    /// Q64.64 price of `tick`: `1.0001^tick`.
+    pub fn tick_price(_env: Env, tick: i32) -> Result<u128, AmmError> {
+        tick_bitmap::tick_to_price_q64(tick)
+    }
+
+    /// Next initialized tick in the swap direction, scanning at most
+    /// `max_words` bitmap words. See [`tick_bitmap::next_initialized_tick`].
+    pub fn next_initialized_tick(
+        env: Env,
+        tick: i32,
+        tick_spacing: i32,
+        lte: bool,
+        max_words: u32,
+    ) -> Result<(i32, bool), AmmError> {
+        tick_bitmap::next_initialized_tick(&env, tick, tick_spacing, lte, max_words)
+    }
 }
 
 #[cfg(test)]
@@ -416,5 +445,27 @@ mod test {
         let trader = Address::generate(&env);
         let result = client.try_swap(&trader, &0, &0);
         assert!(result.is_err(), "zero amount_in should be rejected");
+    }
+
+    #[test]
+    fn test_tick_entrypoints() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AmmContract);
+        let client = AmmContractClient::new(&env, &contract_id);
+
+        assert_eq!(client.tick_price(&0), tick_bitmap::Q64);
+        assert_eq!(
+            client.try_tick_price(&(tick_bitmap::MAX_TICK + 1)),
+            Err(Ok(AmmError::TickOutOfBounds))
+        );
+
+        env.as_contract(&contract_id, || {
+            tick_bitmap::flip_tick(&env, 600, 60).unwrap();
+        });
+        assert_eq!(client.next_initialized_tick(&0, &60, &false, &10), (600, true));
+        assert_eq!(
+            client.try_next_initialized_tick(&0, &0, &false, &10),
+            Err(Ok(AmmError::InvalidTickSpacing))
+        );
     }
 }
