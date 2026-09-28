@@ -67,7 +67,7 @@ fn test_initialize_sets_admin_and_token() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #2)")]
+#[should_panic(expected = "ContractError(Contract, #2)")]
 fn test_initialize_twice_fails() {
     let s = setup();
     let c = client(&s);
@@ -96,7 +96,7 @@ fn test_create_remittance_escrows_funds() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #4)")]
+#[should_panic(expected = "ContractError(Contract, #4)")]
 fn test_create_remittance_zero_amount_fails() {
     let s = setup();
     let c = client(&s);
@@ -122,7 +122,7 @@ fn test_deposit_collateral() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #4)")]
+#[should_panic(expected = "ContractError(Contract, #4)")]
 fn test_deposit_collateral_zero_amount_fails() {
     let s = setup();
     let c = client(&s);
@@ -144,7 +144,7 @@ fn test_submit_payout_proof_completes_remittance() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
+#[should_panic(expected = "ContractError(Contract, #3)")]
 fn test_submit_payout_proof_wrong_anchor_fails() {
     let s = setup();
     let c = client(&s);
@@ -177,7 +177,7 @@ fn test_proof_before_deadline_prevents_later_dispute() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
+#[should_panic(expected = "ContractError(Contract, #7)")]
 fn test_dispute_rejected_before_window_elapsed() {
     let s = setup();
     let c = client(&s);
@@ -191,7 +191,7 @@ fn test_dispute_rejected_before_window_elapsed() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
+#[should_panic(expected = "ContractError(Contract, #7)")]
 fn test_dispute_rejected_one_second_before_window_closes() {
     let s = setup();
     let c = client(&s);
@@ -230,7 +230,7 @@ fn test_dispute_succeeds_after_window_refunds_and_locks_collateral() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
+#[should_panic(expected = "ContractError(Contract, #3)")]
 fn test_dispute_wrong_sender_fails() {
     let s = setup();
     let c = client(&s);
@@ -243,7 +243,7 @@ fn test_dispute_wrong_sender_fails() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "ContractError(Contract, #6)")]
 fn test_double_dispute_rejected() {
     let s = setup();
     let c = client(&s);
@@ -258,7 +258,7 @@ fn test_double_dispute_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "ContractError(Contract, #6)")]
 fn test_dispute_after_completion_rejected() {
     let s = setup();
     let c = client(&s);
@@ -315,7 +315,7 @@ fn test_dispute_with_zero_collateral_still_refunds_sender() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "ContractError(Contract, #5)")]
 fn test_get_remittance_not_found() {
     let s = setup();
     let c = client(&s);

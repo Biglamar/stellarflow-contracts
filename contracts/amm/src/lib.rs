@@ -42,14 +42,21 @@ fn mul_high(a: u128, b: u128) -> u128 {
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum AmmError {
+pub enum ContractError {
+    /// Recovery steps: Inspect the state for AlreadyInitialized and retry with valid inputs or proper conditions.
     AlreadyInitialized = 1,
+    /// Recovery steps: Inspect the state for NotInitialized and retry with valid inputs or proper conditions.
     NotInitialized = 2,
+    /// Recovery steps: Inspect the state for InvalidDepositRatio and retry with valid inputs or proper conditions.
     InvalidDepositRatio = 3,
+    /// Recovery steps: Inspect the state for SlippageExceeded and retry with valid inputs or proper conditions.
     SlippageExceeded = 4,
+    /// Recovery steps: Inspect the state for ZeroDeposit and retry with valid inputs or proper conditions.
     ZeroDeposit = 5,
+    /// Recovery steps: Inspect the state for PoolEmpty and retry with valid inputs or proper conditions.
     PoolEmpty = 6,
     /// Constant-product invariant violated: k_new < k_old after a swap.
+    /// Recovery steps: Inspect the state for InvariantViolation and retry with valid inputs or proper conditions.
     InvariantViolation = 7,
 }
 
@@ -63,10 +70,10 @@ impl AmmContract {
         token_a: Address,
         token_b: Address,
         lp_token: Address,
-    ) -> Result<(), AmmError> {
+    ) -> Result<(), ContractError> {
         let key_init = symbol_short!("init");
         if env.storage().instance().has(&key_init) {
-            return Err(AmmError::AlreadyInitialized);
+            return Err(ContractError::AlreadyInitialized);
         }
         env.storage().instance().set(&key_init, &true);
         env.storage()
@@ -96,28 +103,28 @@ impl AmmContract {
         amount_a_desired: i128,
         amount_b_desired: i128,
         min_lp_mint: i128,
-    ) -> Result<i128, AmmError> {
+    ) -> Result<i128, ContractError> {
         provider.require_auth();
 
         if amount_a_desired <= 0 || amount_b_desired <= 0 {
-            return Err(AmmError::ZeroDeposit);
+            return Err(ContractError::ZeroDeposit);
         }
 
         let token_a_addr: Address = env
             .storage()
             .instance()
             .get(&symbol_short!("token_a"))
-            .ok_or(AmmError::NotInitialized)?;
+            .ok_or(ContractError::NotInitialized)?;
         let token_b_addr: Address = env
             .storage()
             .instance()
             .get(&symbol_short!("token_b"))
-            .ok_or(AmmError::NotInitialized)?;
+            .ok_or(ContractError::NotInitialized)?;
         let lp_token_addr: Address = env
             .storage()
             .instance()
             .get(&symbol_short!("lp_token"))
-            .ok_or(AmmError::NotInitialized)?;
+            .ok_or(ContractError::NotInitialized)?;
 
         let mut reserve_a: i128 = env
             .storage()
@@ -138,13 +145,13 @@ impl AmmContract {
         let (deposit_a, deposit_b, minted_shares) = if total_shares == 0 {
             let initial_shares = amount_a_desired;
             if initial_shares < min_lp_mint {
-                return Err(AmmError::SlippageExceeded);
+                return Err(ContractError::SlippageExceeded);
             }
             (amount_a_desired, amount_b_desired, initial_shares)
         } else {
             let required_b = (amount_a_desired * reserve_b) / reserve_a;
             if amount_b_desired < required_b {
-                return Err(AmmError::InvalidDepositRatio);
+                return Err(ContractError::InvalidDepositRatio);
             }
             let optimal_a = (amount_b_desired * reserve_a) / reserve_b;
             let (opt_a, opt_b) = if optimal_a <= amount_a_desired {
@@ -155,7 +162,7 @@ impl AmmContract {
 
             let shares = (opt_a * total_shares) / reserve_a;
             if shares < min_lp_mint {
-                return Err(AmmError::SlippageExceeded);
+                return Err(ContractError::SlippageExceeded);
             }
             (opt_a, opt_b, shares)
         };
@@ -191,29 +198,29 @@ impl AmmContract {
     /// Invariant check:
     ///   - `k_old = reserve_a * reserve_b`  (stored before trade)
     ///   - `k_new = reserve_a_after * reserve_b_after`  (computed after trade)
-    ///   - Reverts with [`AmmError::InvariantViolation`] if `k_new < k_old`.
+    ///   - Reverts with [`ContractError::InvariantViolation`] if `k_new < k_old`.
     pub fn swap(
         env: Env,
         trader: Address,
         amount_in: i128,
         min_amount_out: i128,
-    ) -> Result<i128, AmmError> {
+    ) -> Result<i128, ContractError> {
         trader.require_auth();
 
         if amount_in <= 0 {
-            return Err(AmmError::ZeroDeposit);
+            return Err(ContractError::ZeroDeposit);
         }
 
         let token_a_addr: Address = env
             .storage()
             .instance()
             .get(&symbol_short!("token_a"))
-            .ok_or(AmmError::NotInitialized)?;
+            .ok_or(ContractError::NotInitialized)?;
         let token_b_addr: Address = env
             .storage()
             .instance()
             .get(&symbol_short!("token_b"))
-            .ok_or(AmmError::NotInitialized)?;
+            .ok_or(ContractError::NotInitialized)?;
 
         let reserve_a: i128 = env
             .storage()
@@ -227,7 +234,7 @@ impl AmmContract {
             .unwrap_or(0);
 
         if reserve_a <= 0 || reserve_b <= 0 {
-            return Err(AmmError::PoolEmpty);
+            return Err(ContractError::PoolEmpty);
         }
 
         // --- Store pre-swap invariant k_old = reserve_a * reserve_b ---
@@ -242,26 +249,26 @@ impl AmmContract {
         // --- Constant-product formula: amount_out = reserve_b * amount_in / (reserve_a + amount_in) ---
         let numerator = reserve_b
             .checked_mul(amount_in)
-            .ok_or(AmmError::SlippageExceeded)?;
+            .ok_or(ContractError::SlippageExceeded)?;
         let denominator = reserve_a
             .checked_add(amount_in)
-            .ok_or(AmmError::SlippageExceeded)?;
+            .ok_or(ContractError::SlippageExceeded)?;
         let amount_out = numerator / denominator; // floor division favors pool
 
         if amount_out < min_amount_out {
-            return Err(AmmError::SlippageExceeded);
+            return Err(ContractError::SlippageExceeded);
         }
         if amount_out <= 0 {
-            return Err(AmmError::SlippageExceeded);
+            return Err(ContractError::SlippageExceeded);
         }
 
         // --- Compute post-swap reserves ---
         let new_reserve_a = reserve_a
             .checked_add(amount_in)
-            .ok_or(AmmError::SlippageExceeded)?;
+            .ok_or(ContractError::SlippageExceeded)?;
         let new_reserve_b = reserve_b
             .checked_sub(amount_out)
-            .ok_or(AmmError::SlippageExceeded)?;
+            .ok_or(ContractError::SlippageExceeded)?;
 
         // --- Compute post-swap invariant k_new = new_reserve_a * new_reserve_b ---
         let k_new_a = new_reserve_a as u128;
@@ -272,7 +279,7 @@ impl AmmContract {
         // --- Revert if k_new < k_old (compare as (hi, lo) big-endian pairs) ---
         let invariant_holds = k_new_hi > k_old_hi || (k_new_hi == k_old_hi && k_new_lo >= k_old_lo);
         if !invariant_holds {
-            return Err(AmmError::InvariantViolation);
+            return Err(ContractError::InvariantViolation);
         }
 
         // --- Execute token transfers ---

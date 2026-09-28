@@ -144,124 +144,215 @@ use crate::upgrades::migration::ensure_schema_version;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ContractError {
+    /// Recovery steps: Inspect the state for AlreadyInitialized and retry with valid inputs or proper conditions.
     AlreadyInitialized = 1,
+    /// Recovery steps: Inspect the state for NotInitialized and retry with valid inputs or proper conditions.
     NotInitialized = 2,
+    /// Recovery steps: Inspect the state for NotAdmin and retry with valid inputs or proper conditions.
     NotAdmin = 3,
+    /// Recovery steps: Inspect the state for NoPendingUpgrade and retry with valid inputs or proper conditions.
     NoPendingUpgrade = 4,
+    /// Recovery steps: Inspect the state for UpgradeTimelockNotSatisfied and retry with valid inputs or proper conditions.
     UpgradeTimelockNotSatisfied = 5,
+    /// Recovery steps: Inspect the state for InvalidHeartbeatInterval and retry with valid inputs or proper conditions.
     InvalidHeartbeatInterval = 6,
+    /// Recovery steps: Inspect the state for InvalidNonce and retry with valid inputs or proper conditions.
     InvalidNonce = 7,
+    /// Recovery steps: Inspect the state for AlreadyRegistered and retry with valid inputs or proper conditions.
     AlreadyRegistered = 8,
+    /// Recovery steps: Inspect the state for NotRegistered and retry with valid inputs or proper conditions.
     NotRegistered = 9,
+    /// Recovery steps: Inspect the state for InvalidStakeAmount and retry with valid inputs or proper conditions.
     InvalidStakeAmount = 10,
+    /// Recovery steps: Inspect the state for Overflow and retry with valid inputs or proper conditions.
     Overflow = 11,
+    /// Recovery steps: Inspect the state for Unauthorized and retry with valid inputs or proper conditions.
     Unauthorized = 12,
+    /// Recovery steps: Inspect the state for TargetNotAdmin and retry with valid inputs or proper conditions.
     TargetNotAdmin = 13,
+    /// Recovery steps: Inspect the state for ProposalAlreadyActive and retry with valid inputs or proper conditions.
     ProposalAlreadyActive = 14,
+    /// Recovery steps: Inspect the state for NoActiveProposal and retry with valid inputs or proper conditions.
     NoActiveProposal = 15,
+    /// Recovery steps: Inspect the state for AlreadyVoted and retry with valid inputs or proper conditions.
     AlreadyVoted = 16,
+    /// Recovery steps: Inspect the state for ThresholdNotReached and retry with valid inputs or proper conditions.
     ThresholdNotReached = 17,
+    /// Recovery steps: Inspect the state for SignatureExpired and retry with valid inputs or proper conditions.
     SignatureExpired = 18,
+    /// Recovery steps: Inspect the state for InvalidSaltSignature and retry with valid inputs or proper conditions.
     InvalidSaltSignature = 19,
     /// Stake amount is below the tier minimum for the target currency feed.
+    /// Recovery steps: Inspect the state for InsufficientStakeForTier and retry with valid inputs or proper conditions.
     InsufficientStakeForTier = 20,
     /// Staking tier configuration is invalid or non-monotonic.
+    /// Recovery steps: Inspect the state for InvalidTierConfig and retry with valid inputs or proper conditions.
     InvalidTierConfig = 21,
     /// Node is already registered for this currency feed.
+    /// Recovery steps: Inspect the state for FeedAlreadyRegistered and retry with valid inputs or proper conditions.
     FeedAlreadyRegistered = 22,
     /// Validator's active locked stake is below the required bond for the
     /// premium asset pool.
+    /// Recovery steps: Inspect the state for PremiumPoolAccessDenied and retry with valid inputs or proper conditions.
     PremiumPoolAccessDenied = 23,
     /// An ownership transfer proposal is already active.
+    /// Recovery steps: Inspect the state for TransferAlreadyPending and retry with valid inputs or proper conditions.
     TransferAlreadyPending = 24,
     /// No pending owner nominee exists to claim ownership.
+    /// Recovery steps: Inspect the state for NoPendingOwner and retry with valid inputs or proper conditions.
     NoPendingOwner = 25,
+    /// Recovery steps: Inspect the state for FeeCeilingExceeded and retry with valid inputs or proper conditions.
     FeeCeilingExceeded = 26,
+    /// Recovery steps: Inspect the state for DivisionByZero and retry with valid inputs or proper conditions.
     DivisionByZero = 27,
+    /// Recovery steps: Inspect the state for StaleSequence and retry with valid inputs or proper conditions.
     StaleSequence = 28,
+    /// Recovery steps: Inspect the state for InvalidVarianceConfig and retry with valid inputs or proper conditions.
     InvalidVarianceConfig = 29,
+    /// Recovery steps: Inspect the state for StaleTelemetryPayload and retry with valid inputs or proper conditions.
     StaleTelemetryPayload = 30,
+    /// Recovery steps: Inspect the state for InsufficientReserveBalance and retry with valid inputs or proper conditions.
     InsufficientReserveBalance = 31,
+    /// Recovery steps: Inspect the state for InsufficientVolume and retry with valid inputs or proper conditions.
     InsufficientVolume = 32,
+    /// Recovery steps: Inspect the state for InsufficientLiquidityDepth and retry with valid inputs or proper conditions.
     InsufficientLiquidityDepth = 33,
+    /// Recovery steps: Inspect the state for ContractPaused and retry with valid inputs or proper conditions.
     ContractPaused = 34,
+    /// Recovery steps: Inspect the state for RevokedAddress and retry with valid inputs or proper conditions.
     RevokedAddress = 35,
+    /// Recovery steps: Inspect the state for EmergencyRevocationActive and retry with valid inputs or proper conditions.
     EmergencyRevocationActive = 36,
+    /// Recovery steps: Inspect the state for NoActiveEmergencyRevocation and retry with valid inputs or proper conditions.
     NoActiveEmergencyRevocation = 37,
+    /// Recovery steps: Inspect the state for BundleAssetLimitExceeded and retry with valid inputs or proper conditions.
     BundleAssetLimitExceeded = 38,
+    /// Recovery steps: Inspect the state for BundleValidationFailed and retry with valid inputs or proper conditions.
     BundleValidationFailed = 39,
+    /// Recovery steps: Inspect the state for IncompleteQuorum and retry with valid inputs or proper conditions.
     IncompleteQuorum = 40,
+    /// Recovery steps: Inspect the state for EpochClosed and retry with valid inputs or proper conditions.
     EpochClosed = 41,
+    /// Recovery steps: Inspect the state for AdminChangePending and retry with valid inputs or proper conditions.
     AdminChangePending = 42,
+    /// Recovery steps: Inspect the state for NoAdminChangePending and retry with valid inputs or proper conditions.
     NoAdminChangePending = 43,
+    /// Recovery steps: Inspect the state for CosignerCannotBeProposer and retry with valid inputs or proper conditions.
     CosignerCannotBeProposer = 44,
+    /// Recovery steps: Inspect the state for AdminTimelockNotSatisfied and retry with valid inputs or proper conditions.
     AdminTimelockNotSatisfied = 45,
+    /// Recovery steps: Inspect the state for InsufficientBondForPenalty and retry with valid inputs or proper conditions.
     InsufficientBondForPenalty = 46,
+    /// Recovery steps: Inspect the state for SlippageExceeded and retry with valid inputs or proper conditions.
     SlippageExceeded = 47,
+    /// Recovery steps: Inspect the state for AmountTooLow and retry with valid inputs or proper conditions.
     AmountTooLow = 48,
+    /// Recovery steps: Inspect the state for InvalidProof and retry with valid inputs or proper conditions.
     InvalidProof = 49,
     /// Reentrancy guard detected a reentrant call during execution.
+    /// Recovery steps: Inspect the state for ReentrancyDetected and retry with valid inputs or proper conditions.
     ReentrancyDetected = 58,
+    /// Recovery steps: Inspect the state for MerkleTreeFull and retry with valid inputs or proper conditions.
     MerkleTreeFull = 59,
+    /// Recovery steps: Inspect the state for NotSecurityCouncil and retry with valid inputs or proper conditions.
     NotSecurityCouncil = 60,
+    /// Recovery steps: Inspect the state for ProposalNotFound and retry with valid inputs or proper conditions.
     ProposalNotFound = 61,
+    /// Recovery steps: Inspect the state for ProposalNotVetoable and retry with valid inputs or proper conditions.
     ProposalNotVetoable = 62,
+    /// Recovery steps: Inspect the state for ProposalAlreadyVetoed and retry with valid inputs or proper conditions.
     ProposalAlreadyVetoed = 63,
     /// Spot price executed by an AMM swap deviates from the TWAP oracle value
     /// by more than the governance-configured safety threshold (Issue #743).
+    /// Recovery steps: Inspect the state for OracleDeviationTooHigh and retry with valid inputs or proper conditions.
     OracleDeviationTooHigh = 64,
     /// An oracle deviation guard configuration violates its structural bounds.
+    /// Recovery steps: Inspect the state for InvalidOracleDeviationConfig and retry with valid inputs or proper conditions.
     InvalidOracleDeviationConfig = 65,
     /// AMM math was called with a structurally invalid input.
+    /// Recovery steps: Inspect the state for InvalidInput and retry with valid inputs or proper conditions.
     InvalidInput = 66,
     /// Circuit breaker configuration violates its structural invariants.
+    /// Recovery steps: Inspect the state for InvalidCircuitBreakerConfig and retry with valid inputs or proper conditions.
     InvalidCircuitBreakerConfig = 67,
     /// Pool trading is currently frozen by the spot-price circuit breaker.
+    /// Recovery steps: Inspect the state for CircuitBreakerTripped and retry with valid inputs or proper conditions.
     CircuitBreakerTripped = 68,
     /// Deadline for an operation has passed.
+    /// Recovery steps: Inspect the state for DeadlineReached and retry with valid inputs or proper conditions.
     DeadlineReached = 69,
     /// Deadline for an operation has not yet been reached.
+    /// Recovery steps: Inspect the state for DeadlineNotReached and retry with valid inputs or proper conditions.
     DeadlineNotReached = 70,
     /// Deadline is too soon (minimum offset not satisfied).
+    /// Recovery steps: Inspect the state for DeadlineTooSoon and retry with valid inputs or proper conditions.
     DeadlineTooSoon = 71,
     /// Deadline is too far in the future (maximum offset exceeded).
+    /// Recovery steps: Inspect the state for DeadlineTooFar and retry with valid inputs or proper conditions.
     DeadlineTooFar = 72,
     /// Invalid argument provided to a function.
+    /// Recovery steps: Inspect the state for InvalidArgument and retry with valid inputs or proper conditions.
     InvalidArgument = 73,
     /// Invalid asset identifier.
+    /// Recovery steps: Inspect the state for InvalidAsset and retry with valid inputs or proper conditions.
     InvalidAsset = 74,
     /// Escrow is in an invalid state for the requested operation.
+    /// Recovery steps: Inspect the state for InvalidEscrowState and retry with valid inputs or proper conditions.
     InvalidEscrowState = 75,
     /// Tick spacing must be a strictly positive integer.
+    /// Recovery steps: Inspect the state for InvalidTickSpacing and retry with valid inputs or proper conditions.
     InvalidTickSpacing = 76,
     /// The tick index for this pool already exists.
+    /// Recovery steps: Inspect the state for TickIndexAlreadyExists and retry with valid inputs or proper conditions.
     TickIndexAlreadyExists = 77,
     /// No tick index exists for this pool.
+    /// Recovery steps: Inspect the state for TickIndexNotFound and retry with valid inputs or proper conditions.
     TickIndexNotFound = 78,
     /// Tick must be aligned to the pool's configured tick spacing.
+    /// Recovery steps: Inspect the state for TickNotAligned and retry with valid inputs or proper conditions.
     TickNotAligned = 79,
     /// Tick index is outside the allowed price range bounds.
+    /// Recovery steps: Inspect the state for TickOutOfBounds and retry with valid inputs or proper conditions.
     TickOutOfBounds = 80,
     /// Too many initialized ticks for a single pool.
+    /// Recovery steps: Inspect the state for TooManyTicks and retry with valid inputs or proper conditions.
     TooManyTicks = 81,
     /// Protected asset (primary pool or vault reserve) cannot be rescued.
+    /// Recovery steps: Inspect the state for ProtectedAssetNotRescueable and retry with valid inputs or proper conditions.
     ProtectedAssetNotRescueable = 82,
     /// Token rescue proposal was not found.
+    /// Recovery steps: Inspect the state for RescueProposalNotFound and retry with valid inputs or proper conditions.
     RescueProposalNotFound = 83,
     /// Token rescue proposal is not pending.
+    /// Recovery steps: Inspect the state for RescueProposalNotPending and retry with valid inputs or proper conditions.
     RescueProposalNotPending = 84,
     /// Mandatory timelock delay has not expired yet.
+    /// Recovery steps: Inspect the state for RescueTimelockNotExpired and retry with valid inputs or proper conditions.
     RescueTimelockNotExpired = 85,
     /// Emergency override mechanism is disabled.
+    /// Recovery steps: Inspect the state for EmergencyOverrideDisabled and retry with valid inputs or proper conditions.
     EmergencyOverrideDisabled = 86,
     /// Caller is not an authorized emergency signer.
+    /// Recovery steps: Inspect the state for NotEmergencySigner and retry with valid inputs or proper conditions.
     NotEmergencySigner = 87,
     /// Emergency override vote threshold not yet reached.
+    /// Recovery steps: Inspect the state for OverrideThresholdNotReached and retry with valid inputs or proper conditions.
     OverrideThresholdNotReached = 81,
     /// Dynamic remittance fee split configuration is invalid.
+    /// Recovery steps: Inspect the state for InvalidFeeSplitConfig and retry with valid inputs or proper conditions.
     InvalidFeeSplitConfig = 82,
     /// A fee allocation does not add up to the original total.
+    /// Recovery steps: Inspect the state for FeeDistributionMismatch and retry with valid inputs or proper conditions.
     FeeDistributionMismatch = 83,
+    /// Mapped error from Soroban host.
+    /// Recovery steps: Inspect the state for HostError and retry with valid inputs or proper conditions.
+    HostError = 88,
+}
+
+impl From<soroban_sdk::Error> for ContractError {
+    fn from(_: soroban_sdk::Error) -> Self {
+        ContractError::HostError
+    }
 }
 
 impl ContractError {

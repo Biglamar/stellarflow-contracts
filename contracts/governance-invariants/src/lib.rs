@@ -8,17 +8,28 @@ use soroban_sdk::{
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum InvariantError {
+pub enum ContractError {
+    /// Recovery steps: Inspect the state for AlreadyInitialized and retry with valid inputs or proper conditions.
     AlreadyInitialized = 1,
+    /// Recovery steps: Inspect the state for NotInitialized and retry with valid inputs or proper conditions.
     NotInitialized = 2,
+    /// Recovery steps: Inspect the state for NotAdmin and retry with valid inputs or proper conditions.
     NotAdmin = 3,
+    /// Recovery steps: Inspect the state for VotingWeightDrift and retry with valid inputs or proper conditions.
     VotingWeightDrift = 4,
+    /// Recovery steps: Inspect the state for UserNotFound and retry with valid inputs or proper conditions.
     UserNotFound = 5,
+    /// Recovery steps: Inspect the state for InvalidAmount and retry with valid inputs or proper conditions.
     InvalidAmount = 6,
+    /// Recovery steps: Inspect the state for LockAlreadyExists and retry with valid inputs or proper conditions.
     LockAlreadyExists = 7,
+    /// Recovery steps: Inspect the state for NoLockFound and retry with valid inputs or proper conditions.
     NoLockFound = 8,
+    /// Recovery steps: Inspect the state for Overflow and retry with valid inputs or proper conditions.
     Overflow = 9,
+    /// Recovery steps: Inspect the state for DelegationCycleDetected and retry with valid inputs or proper conditions.
     DelegationCycleDetected = 10,
+    /// Recovery steps: Inspect the state for InvalidDelegate and retry with valid inputs or proper conditions.
     InvalidDelegate = 11,
 }
 
@@ -86,7 +97,7 @@ fn propagate_delegated_weight(
     env: &Env,
     start_user: &Address,
     delta: i128,
-) -> Result<(), InvariantError> {
+) -> Result<(), ContractError> {
     if delta == 0 {
         return Ok(());
     }
@@ -98,7 +109,7 @@ fn propagate_delegated_weight(
         let old_delegated = get_delegated_weight(env, &next);
         let new_delegated = old_delegated
             .checked_add(delta)
-            .ok_or(InvariantError::Overflow)?;
+            .ok_or(ContractError::Overflow)?;
         set_delegated_weight(env, &next, new_delegated);
         current = next;
     }
@@ -108,9 +119,9 @@ fn propagate_delegated_weight(
 #[contractimpl]
 impl GovernanceInvariantsContract {
     /// Initialize the invariant check suite.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), InvariantError> {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            return Err(InvariantError::AlreadyInitialized);
+            return Err(ContractError::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -130,11 +141,11 @@ impl GovernanceInvariantsContract {
         env: Env,
         user: Address,
         amount: i128,
-    ) -> Result<VotingWeightLock, InvariantError> {
+    ) -> Result<VotingWeightLock, ContractError> {
         user.require_auth();
 
         if amount <= 0 {
-            return Err(InvariantError::InvalidAmount);
+            return Err(ContractError::InvalidAmount);
         }
 
         // Pre-action invariant check
@@ -145,7 +156,7 @@ impl GovernanceInvariantsContract {
 
         let lock_key = DataKey::UserWeight(user.clone());
         if env.storage().instance().has(&lock_key) {
-            return Err(InvariantError::LockAlreadyExists);
+            return Err(ContractError::LockAlreadyExists);
         }
 
         let lock = VotingWeightLock {
@@ -165,7 +176,7 @@ impl GovernanceInvariantsContract {
             .instance()
             .get(&DataKey::TotalVotingWeight)
             .unwrap_or(0);
-        let new_total = total.checked_add(weight).ok_or(InvariantError::Overflow)?;
+        let new_total = total.checked_add(weight).ok_or(ContractError::Overflow)?;
         env.storage()
             .instance()
             .set(&DataKey::TotalVotingWeight, &new_total);
@@ -190,11 +201,11 @@ impl GovernanceInvariantsContract {
         env: Env,
         user: Address,
         additional_amount: i128,
-    ) -> Result<VotingWeightLock, InvariantError> {
+    ) -> Result<VotingWeightLock, ContractError> {
         user.require_auth();
 
         if additional_amount <= 0 {
-            return Err(InvariantError::InvalidAmount);
+            return Err(ContractError::InvalidAmount);
         }
 
         // Pre-action invariant check
@@ -205,7 +216,7 @@ impl GovernanceInvariantsContract {
             .storage()
             .instance()
             .get(&lock_key)
-            .ok_or(InvariantError::NoLockFound)?;
+            .ok_or(ContractError::NoLockFound)?;
 
         // Remove old weight from total
         let old_total: i128 = env
@@ -217,7 +228,7 @@ impl GovernanceInvariantsContract {
         let new_locked = lock
             .locked_amount
             .checked_add(additional_amount)
-            .ok_or(InvariantError::Overflow)?;
+            .ok_or(ContractError::Overflow)?;
         let old_weight = lock.weight;
         let new_weight = compute_weight(new_locked);
         let delta = new_weight - old_weight;
@@ -228,7 +239,7 @@ impl GovernanceInvariantsContract {
 
         let new_total = old_total
             .checked_add(delta)
-            .ok_or(InvariantError::Overflow)?;
+            .ok_or(ContractError::Overflow)?;
         env.storage()
             .instance()
             .set(&DataKey::TotalVotingWeight, &new_total);
@@ -261,11 +272,11 @@ impl GovernanceInvariantsContract {
         delegator: Address,
         delegatee: Address,
         weight_to_delegate: i128,
-    ) -> Result<(), InvariantError> {
+    ) -> Result<(), ContractError> {
         delegator.require_auth();
 
         if weight_to_delegate <= 0 {
-            return Err(InvariantError::InvalidAmount);
+            return Err(ContractError::InvalidAmount);
         }
 
         // Pre-action invariant check
@@ -276,10 +287,10 @@ impl GovernanceInvariantsContract {
             .storage()
             .instance()
             .get(&delegator_key)
-            .ok_or(InvariantError::NoLockFound)?;
+            .ok_or(ContractError::NoLockFound)?;
 
         if delegator_lock.weight < weight_to_delegate {
-            return Err(InvariantError::InvalidAmount);
+            return Err(ContractError::InvalidAmount);
         }
 
         // Reduce delegator's weight
@@ -327,7 +338,7 @@ impl GovernanceInvariantsContract {
         env: Env,
         delegator: Address,
         to_address: Address,
-    ) -> Result<(), InvariantError> {
+    ) -> Result<(), ContractError> {
         delegator.require_auth();
 
         // Check if delegator has a lock
@@ -336,7 +347,7 @@ impl GovernanceInvariantsContract {
             .storage()
             .instance()
             .get(&delegator_key)
-            .ok_or(InvariantError::NoLockFound)?;
+            .ok_or(ContractError::NoLockFound)?;
 
         let is_reclaim = to_address == delegator;
 
@@ -345,7 +356,7 @@ impl GovernanceInvariantsContract {
             let mut current = to_address.clone();
             while let Some(next) = get_delegate(&env, &current) {
                 if next == delegator {
-                    return Err(InvariantError::DelegationCycleDetected);
+                    return Err(ContractError::DelegationCycleDetected);
                 }
                 if next == current {
                     break;
@@ -374,7 +385,7 @@ impl GovernanceInvariantsContract {
         let delegated_in = get_delegated_weight(&env, &delegator);
         let total_weight_to_shift = own_weight
             .checked_add(delegated_in)
-            .ok_or(InvariantError::Overflow)?;
+            .ok_or(ContractError::Overflow)?;
 
         // Pre-action invariant check
         Self::assert_invariant_holds(&env)?;
@@ -475,7 +486,7 @@ impl GovernanceInvariantsContract {
     }
 
     /// Checkpoints/reclaims a voter's delegated power back to themselves if they vote directly.
-    pub fn checkpoint_reclaim_on_vote(env: Env, voter: Address) -> Result<(), InvariantError> {
+    pub fn checkpoint_reclaim_on_vote(env: Env, voter: Address) -> Result<(), ContractError> {
         if let Some(delegate) = get_delegate(&env, &voter) {
             if delegate != voter {
                 Self::delegate(env.clone(), voter.clone(), voter.clone())?;
@@ -501,7 +512,7 @@ impl GovernanceInvariantsContract {
     ///
     /// This checks that the aggregate weight stored on-chain matches the
     /// sum of all individual user weights. Panics immediately if drift is detected.
-    fn assert_invariant_holds(env: &Env) -> Result<(), InvariantError> {
+    fn assert_invariant_holds(env: &Env) -> Result<(), ContractError> {
         // Note: In a production Soroban contract, iterating all users is not
         // feasible due to compute limits. This implementation uses a counter-based
         // approach: the stored total is updated atomically on every mutation.
@@ -521,7 +532,7 @@ impl GovernanceInvariantsContract {
 
         // Invariant: total voting weight must never go negative
         if stored_total < 0 {
-            panic!("VOTING_WEIGHT_DRIFT: total weight is negative");
+            return Err(ContractError::VotingWeightDriftTotalWeightIsNegative);
         }
 
         Ok(())
@@ -537,7 +548,7 @@ impl GovernanceInvariantsContract {
     pub fn verify_full_invariant(
         env: Env,
         known_users: soroban_sdk::Vec<Address>,
-    ) -> Result<i128, InvariantError> {
+    ) -> Result<i128, ContractError> {
         let stored_total: i128 = env
             .storage()
             .instance()
@@ -554,7 +565,7 @@ impl GovernanceInvariantsContract {
             {
                 computed_total = computed_total
                     .checked_add(lock.weight)
-                    .ok_or(InvariantError::Overflow)?;
+                    .ok_or(ContractError::Overflow)?;
             }
         }
 
@@ -709,7 +720,7 @@ mod tests {
 
         client.initialize(&admin);
         let result = client.try_lock_tokens(&user, &0);
-        assert_eq!(result, Err(Ok(InvariantError::InvalidAmount)));
+        assert_eq!(result, Err(Ok(ContractError::InvalidAmount)));
     }
 
     #[test]
@@ -722,7 +733,7 @@ mod tests {
         client.lock_tokens(&user, &1000_0000000);
 
         let result = client.try_lock_tokens(&user, &500_0000000);
-        assert_eq!(result, Err(Ok(InvariantError::LockAlreadyExists)));
+        assert_eq!(result, Err(Ok(ContractError::LockAlreadyExists)));
     }
 
     #[test]
@@ -733,7 +744,7 @@ mod tests {
 
         client.initialize(&admin);
         let result = client.try_extend_lock(&user, &500_0000000);
-        assert_eq!(result, Err(Ok(InvariantError::NoLockFound)));
+        assert_eq!(result, Err(Ok(ContractError::NoLockFound)));
     }
 
     #[test]
@@ -860,7 +871,7 @@ mod tests {
 
         // C tries to delegate to A -> should detect cycle and fail
         let result = client.try_delegate(&user_c, &user_a);
-        assert_eq!(result, Err(Ok(InvariantError::DelegationCycleDetected)));
+        assert_eq!(result, Err(Ok(ContractError::DelegationCycleDetected)));
     }
 
     #[test]
