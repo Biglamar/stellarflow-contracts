@@ -181,15 +181,49 @@ pub fn prune_expired_keys(
     for target in targets.iter() {
         match target {
             PruneTarget::Order(order_id) => {
-                let key = OrderStorageKey::Order(order_id);
-                if let Some(order) = env.storage().persistent().get::<_, LimitOrder>(&key) {
+                let mut order_removed = false;
+                let mut maker_opt: Option<Address> = None;
+
+                // Check composite indexing: OrderIndex -> Order(pair, tick, order_id)
+                if let Some(index) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, (crate::orders::limit::AssetPair, i128)>(&OrderStorageKey::OrderIndex(order_id))
+                {
+                    let composite_key = OrderStorageKey::Order(index.0.clone(), index.1, order_id);
+                    if let Some(order) = env.storage().persistent().get::<_, LimitOrder>(&composite_key) {
+                        if !order.active || order.remaining_amount == 0 {
+                            maker_opt = Some(order.maker.clone());
+                            env.storage().persistent().remove(&composite_key);
+                            env.storage().persistent().remove(&OrderStorageKey::OrderIndex(order_id));
+                            order_removed = true;
+                        }
+                    } else {
+                        // Dangling index without order payload, evict index
+                        env.storage().persistent().remove(&OrderStorageKey::OrderIndex(order_id));
+                        order_removed = true;
+                    }
+                }
+
+                // Check legacy / direct Order(order_id) key
+                let legacy_key = OrderStorageKey::Order(order_id);
+                if let Some(order) = env.storage().persistent().get::<_, LimitOrder>(&legacy_key) {
                     // Only prune spent / filled or cancelled orders
                     if !order.active || order.remaining_amount == 0 {
-                        env.storage().persistent().remove(&key);
-                        pruned_count += 1;
+                        if maker_opt.is_none() {
+                            maker_opt = Some(order.maker.clone());
+                        }
+                        env.storage().persistent().remove(&legacy_key);
+                        order_removed = true;
+                    }
+                }
+
+                if order_removed {
+                    pruned_count += 1;
+                    if let Some(maker) = maker_opt {
                         env.events().publish(
                             (symbol_short!("prune"), symbol_short!("order")),
-                            (order_id, order.maker),
+                            (order_id, maker),
                         );
                     }
                 }
@@ -365,11 +399,11 @@ mod tests {
             assert!(env
                 .storage()
                 .persistent()
-                .has(&OrderStorageKey::Order(order0.id)));
+                .has(&OrderStorageKey::OrderIndex(order0.id)));
             assert!(env
                 .storage()
                 .persistent()
-                .has(&OrderStorageKey::Order(order1.id)));
+                .has(&OrderStorageKey::OrderIndex(order1.id)));
         });
 
         // Prune both spent orders
@@ -385,11 +419,11 @@ mod tests {
             assert!(!env
                 .storage()
                 .persistent()
-                .has(&OrderStorageKey::Order(order0.id)));
+                .has(&OrderStorageKey::OrderIndex(order0.id)));
             assert!(!env
                 .storage()
                 .persistent()
-                .has(&OrderStorageKey::Order(order1.id)));
+                .has(&OrderStorageKey::OrderIndex(order1.id)));
         });
     }
 
@@ -771,11 +805,11 @@ mod tests {
             assert!(!env
                 .storage()
                 .persistent()
-                .has(&OrderStorageKey::Order(order_spent.id)));
+                .has(&OrderStorageKey::OrderIndex(order_spent.id)));
             assert!(env
                 .storage()
                 .persistent()
-                .has(&OrderStorageKey::Order(order_active.id)));
+                .has(&OrderStorageKey::OrderIndex(order_active.id)));
             assert!(!env
                 .storage()
                 .persistent()
@@ -811,7 +845,7 @@ mod tests {
         // Verify all 10 entries exist in persistent storage before pruning
         env.as_contract(&contract_id, || {
             for i in 0..10 {
-                assert!(env.storage().persistent().has(&OrderStorageKey::Order(i)));
+                assert!(env.storage().persistent().has(&OrderStorageKey::OrderIndex(i)));
             }
         });
 
@@ -833,7 +867,7 @@ mod tests {
         // Verify that 100% of the pruned storage entries are evicted to recover storage deposits
         env.as_contract(&contract_id, || {
             for i in 0..10 {
-                assert!(!env.storage().persistent().has(&OrderStorageKey::Order(i)));
+                assert!(!env.storage().persistent().has(&OrderStorageKey::OrderIndex(i)));
             }
         });
     }
