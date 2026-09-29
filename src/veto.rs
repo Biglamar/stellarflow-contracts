@@ -61,7 +61,7 @@ pub const MAX_EMERGENCY_OVERRIDE_THRESHOLD_BPS: u32 = 10000;
 
 /// Audit trail record for a vetoed proposal.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProposalVeto {
     /// The proposal ID that was vetoed.
     pub proposal_id: u64,
@@ -83,16 +83,6 @@ pub struct EmergencyOverrideConfig {
     pub threshold_bps: u32,
     /// Whether the emergency override mechanism is enabled.
     pub enabled: bool,
-}
-
-impl Default for EmergencyOverrideConfig {
-    fn default() -> Self {
-        Self {
-            emergency_signers: Vec::new(env),
-            threshold_bps: DEFAULT_EMERGENCY_OVERRIDE_THRESHOLD_BPS,
-            enabled: true,
-        }
-    }
 }
 
 /// Vote record for emergency timelock override.
@@ -208,7 +198,7 @@ pub fn veto_proposal(
         proposal_id,
         vetoed_by: caller.clone(),
         vetoed_at: env.ledger().timestamp(),
-        reason_hash: reason,
+        reason_hash: reason.clone(),
     };
 
     // Store veto record

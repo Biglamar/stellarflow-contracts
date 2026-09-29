@@ -1,42 +1,6 @@
-pub mod cleanup {
-    use super::*;
-
-    pub fn cleanup_expired_proposals(env: &Env) -> Result<u32, ContractError> {
-        super::prune::prune_expired_keys(env, super::prune::PruneTarget::EmergencyRevocation)
-    }
-
-    pub fn reclaim_expired_proposal_deposit(env: &Env, maker: &Address) -> Result<u32, ContractError> {
-        maker.require_auth();
-        cleanup_expired_proposals(env)
-    }
-}
-
-pub mod prune {
-    use super::*;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum PruneTarget {
-        EmergencyRevocation,
-    }
-
-    pub fn prune_expired_keys(env: &Env, target: PruneTarget) -> Result<u32, ContractError> {
-        let mut pruned = 0u32;
-        match target {
-            PruneTarget::EmergencyRevocation => {
-                if let Some(proposal) = get_temp_proposal::<EmergencyRevocationProposal>(
-                    env,
-                    &EMERGENCY_REVOCATION_TEMP_KEY,
-                ) {
-                    if proposal_state(env, proposal.proposed_at) == ProposalState::Expired {
-                        remove_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY);
-                        pruned += 1;
-                    }
-                }
-            }
-        }
-        Ok(pruned)
-    }
-}
+pub mod cleanup;
+pub mod prune;
+pub mod action_queue;
 
 pub use action_queue::{
     cancel_action, execute_action, get_action_timelock_remaining, get_queued_action,
@@ -120,14 +84,34 @@ fn consume_admin_nonce(
 }
 
 /// Helper function to check if an address is a registered signer.
+///
+/// Signers are registered by `register_signer` into the `SIGNERS_KEY` map
+/// (`Map<Address, ()>` in instance storage); this check reads that same map
+/// so the two paths stay consistent.
 fn _is_signer(env: &Env, addr: &Address) -> bool {
-    let signer_key = SignerKey::SignerByAddress(addr.clone());
-    env.storage().instance().has(&signer_key)
+    let signers: soroban_sdk::Map<Address, ()> = env
+        .storage()
+        .instance()
+        .get(&SIGNERS_KEY)
+        .unwrap_or_else(|| soroban_sdk::Map::new(env));
+    signers.contains_key(addr.clone())
+}
+
+/// Number of currently registered signers (admin is never stored in the
+/// signer registry; revocation proposals against the admin need only one
+/// additional vote, handled by the 0-count default in the threshold fn).
+fn _signer_count(env: &Env) -> u32 {
+    let signers: soroban_sdk::Map<Address, ()> = env
+        .storage()
+        .instance()
+        .get(&SIGNERS_KEY)
+        .unwrap_or_else(|| soroban_sdk::Map::new(env));
+    signers.len()
 }
 
 /// Helper function to calculate the revocation threshold.
 fn _revocation_threshold(env: &Env) -> u32 {
-    let signer_count: u32 = env.storage().instance().get(&SIGNERS_KEY).unwrap_or(0u32);
+    let signer_count: u32 = _signer_count(env);
     if signer_count == 0 { 1 } else { signer_count / 2 + 1 }
 }
 
@@ -258,7 +242,6 @@ pub fn propose_emergency_revocation(
     consume_admin_nonce(env, &proposer, AdminAction::ProposeEmergencyRevocation, nonce)?;
 
     // Guard: only one active emergency proposal at a time.
-    prune::prune_expired_keys(env, prune::PruneTarget::EmergencyRevocation)?;
     if has_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY) {
         return Err(ContractError::EmergencyRevocationAlreadyActive);
     }
@@ -369,7 +352,8 @@ pub fn vote_emergency_revocation(
 /// Returns the active emergency revocation proposal, if one exists.
 /// Proposals are stored in temporary storage and will auto-purge after TTL.
 pub fn get_emergency_revocation_proposal(env: &Env) -> Option<EmergencyRevocationProposal> {
-    let proposal = get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)?;
+    let proposal: EmergencyRevocationProposal =
+        get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)?;
     if proposal_state(env, proposal.proposed_at) == ProposalState::Expired {
         None
     } else {
