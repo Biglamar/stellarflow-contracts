@@ -5,12 +5,57 @@
 // It also provides helper functions for node profile management, subscription
 // rent extension, and asset price TTL management.
 use crate::NodeProfile;
-use soroban_sdk::{contracttype, Address, Env, Map, Symbol};
+use soroban_sdk::{contracttype, Address, Env, Map, Symbol, Vec};
+
+pub mod ephemeral;
+
+/// Persistent-entry TTL threshold (~15 days in ledgers).
+pub const PERSISTENT_TTL_THRESHOLD: u32 = 535_680;
+/// Rent threshold for proactive TTL extension (~15 days in ledgers).
+pub const RENT_THRESHOLD: u32 = 259_200;
+/// TTL target applied when a persistent entry falls below `RENT_THRESHOLD`.
+pub const RENT_EXTEND_TO: u32 = 518_400;
+/// Instance/asset TTL threshold used by pre-flight checks.
+pub const ASET_TTL_THRESHOLD: u32 = 5_000;
+
+/// Instance key under which the multi-sig admin signer list is stored.
+const ADMIN_SIGNERS_KEY: Symbol = soroban_sdk::symbol_short!("ADMSIGN");
+/// Instance key under which the multi-sig approval threshold is stored.
+const ADMIN_THRESHOLD_KEY: Symbol = soroban_sdk::symbol_short!("ADMTHR");
+
+/// Read the current multi-sig admin signer list (empty when unset).
+pub fn get_admin_signers(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&ADMIN_SIGNERS_KEY)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Persist the multi-sig admin signer list.
+pub fn set_admin_signers(env: &Env, signers: Vec<Address>) {
+    env.storage().instance().set(&ADMIN_SIGNERS_KEY, &signers);
+}
+
+/// Read the current multi-sig approval threshold (defaults to 1).
+pub fn get_admin_threshold(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&ADMIN_THRESHOLD_KEY)
+        .unwrap_or(1)
+}
+
+/// Persist the multi-sig approval threshold.
+pub fn set_admin_threshold(env: &Env, threshold: u32) {
+    env.storage()
+        .instance()
+        .set(&ADMIN_THRESHOLD_KEY, &threshold);
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Subscription(Address),
+    AssetPrice(Symbol),
 }
 
 /// NOTE: These are single-variant enums, not bare tuple structs. A single-field
@@ -97,6 +142,11 @@ pub struct FeedStakeValue {
 }
 
 /// --- Standardized TTL Helpers ---
+
+/// TTL threshold under which persistent/instance entries are bumped (~10k ledgers).
+const THRESHOLD: u32 = 10_000;
+/// TTL target applied on bump (~100k ledgers).
+const BUMP_AMOUNT: u32 = 100_000;
 
 /// Extends TTL for Persistent storage using strict 10k/100k rule.
 pub fn extend_persistent_ttl<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {

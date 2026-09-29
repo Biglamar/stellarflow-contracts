@@ -1,4 +1,5 @@
 #![no_std]
+extern crate alloc;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short,
     Address, Bytes, BytesN, Env, Map, Symbol, Vec,
@@ -78,8 +79,8 @@ pub mod errors;
 pub mod events;
 pub mod fees;
 pub mod temp_governance;
-use crate::validation::check_bond_capacity;
 pub mod governance;
+pub mod governance_upgrade;
 pub mod math;
 pub mod oracle_attestation;
 pub mod orders;
@@ -94,8 +95,11 @@ pub mod staging;
 pub mod staking_tiers;
 pub mod state_verification;
 pub mod storage;
-pub mod temp_governance;
 pub mod token;
+pub mod twap_window;
+pub mod vaults;
+pub mod veto;
+pub mod voting_delegation;
 pub mod upgrades;
 pub mod validation;
 pub mod zk;
@@ -104,9 +108,10 @@ pub use state_verification::{
     verify_zero_loss_accounting,
 };
 use crate::governance::{
-    calculate_collected_weight, cast_vote, close_ballot, get_ballot, get_multisig_config,
-    open_ballot, verify_staged_delay, verify_upgrade_quorum, GovernanceUpgradeProposal,
-    GovernanceUpgradeProposedEvent, StagedUpgrade, VotingBallot, GOVERNANCE_UPGRADE_KEY,
+    calculate_collected_weight, cast_vote, close_ballot, get_ballot, get_governance_proposal,
+    get_multisig_config, open_ballot, verify_upgrade_quorum, GovernanceProposal,
+    GovernanceUpgradeProposal, GovernanceUpgradeProposedEvent, StagedUpgrade, VotingBallot,
+    GOVERNANCE_UPGRADE_KEY, MIN_LEDGER_DELAY,
 };
 use crate::slashing::{
     apply_escrow_penalty, get_fault_count_in_window, get_penalty_multiplier, record_tracking_fault,
@@ -114,8 +119,12 @@ use crate::slashing::{
 };
 use crate::staking_tiers::{
     assign_tier, effective_volume_score, required_stake_for_tier, validate_tier_config,
+    StakingTier, StakingTierConfig,
 };
+use crate::events::events::{emit_simple2, EV_UPGRADE_PROPOSED};
+use crate::errors::PROPOSAL_EXPIRY_SECONDS;
 use crate::storage::{NodeProfileKey, SignerKey, StakeKey, HeartbeatKey};
+pub use crate::staking_tiers::AssetFeedMetrics;
 use crate::validation::{
     check_bond_capacity, check_liquidity_depth, process_price_bundle, validate_telemetry_submission,
     AssetPriceUpdate, BundleValidationOutcome,
@@ -140,7 +149,7 @@ use crate::upgrades::migration::ensure_schema_version;
 /// The four canonical *external-API* error codes required by issue #720 are
 /// exposed as `const` aliases below the enum definition so they remain stable
 /// regardless of any future renumbering inside the enum body.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ContractError {
@@ -257,11 +266,14 @@ pub enum ContractError {
     /// Caller is not an authorized emergency signer.
     NotEmergencySigner = 87,
     /// Emergency override vote threshold not yet reached.
-    OverrideThresholdNotReached = 81,
+    OverrideThresholdNotReached = 89,
     /// Dynamic remittance fee split configuration is invalid.
-    InvalidFeeSplitConfig = 82,
+    InvalidFeeSplitConfig = 90,
     /// A fee allocation does not add up to the original total.
-    FeeDistributionMismatch = 83,
+    FeeDistributionMismatch = 91,
+    /// The TWAP observation window holds fewer than the minimum (`Nmin`)
+    /// number of samples required to serve a manipulation-resistant price.
+    InsufficientObservations = 88,
 }
 
 impl ContractError {
@@ -331,8 +343,20 @@ const TOTAL_STAKED_KEY: Symbol = symbol_short!("TOTAL");
 const HEARTBEAT_KEY: Symbol = symbol_short!("HBEAT");
 const HB_INTERVAL_KEY: Symbol = symbol_short!("HBINTV");
 pub(crate) const DEFAULT_HEARTBEAT_INTERVAL: u64 = 5 * 60;
-pub(crate) const SIGNERS_KEY: Symbol = symbol_short!("SIGNERS");
+pub(crate) const VALIDATOR_STATE_KEY: Symbol = symbol_short!("VSTATE");
+/// Instance map of proposal-topic -> lifecycle state for multi-sig approvals.
+pub(crate) const PROPOSAL_STATE_KEY: Symbol = symbol_short!("PROPST");
+/// Event/topic identifier for the emergency key-revocation proposal.
+pub(crate) const EMERGENCY_REVOCATION_TOPIC: Symbol = symbol_short!("EMREV");
 const REVOCATION_KEY: Symbol = symbol_short!("REVOKE");
+
+// Canonical numeric asset identifiers used by the built-in currency feeds.
+pub const ID_NGN: AssetId = 3897123275;
+pub const ID_KES: AssetId = 2654435761;
+pub const ID_GHS: AssetId = 4026531840;
+pub const ID_CFA: AssetId = 4160749568;
+pub const ID_ZAR: AssetId = 3219226362;
+pub const ID_UGX: AssetId = 2863311530;
 // Emergency key revocation / blocking
 pub(crate) const REVOKED_SIGNER_KEY: Symbol = symbol_short!("REVOKED");
 // EMERGENCY_REVOCATION_KEY is defined in admin.rs
@@ -350,7 +374,6 @@ pub const FEE_TIER_030_BPS: u32 = 30;
 pub const FEE_TIER_100_BPS: u32 = 100;
 pub const DEFAULT_FEE_TIER_BPS: u32 = FEE_TIER_030_BPS;
 const SEQUENCE_COUNTER_KEY: Symbol = symbol_short!("SEQCTR");
-const REVOCATION_KEY: Symbol = symbol_short!("REVOKE");
 const RECOVERY_KEY: Symbol = symbol_short!("RKEY");
 const LAST_ADMIN_ACTIVITY: Symbol = symbol_short!("LASTACT");
 
@@ -439,14 +462,10 @@ pub enum StakingStorageKey {
     FeedStake(Address, Symbol),
 }
 
-// Storage key newtype wrappers
-#[contracttype] pub struct HeartbeatKey(pub AssetId);
-#[contracttype] pub struct CorridorFeeKey(pub Symbol);
+// Storage key newtype wrappers are defined in `crate::storage`; the canonical
+// `HeartbeatKey`, `CorridorFeeKey`, and `AssetMetricsKey` types live there.
 
 // CorridorFeePool is imported/used from the fees module
-
-// AssetMetrics key wrapper
-#[contracttype] pub struct AssetMetricsKey(pub AssetId);
 
 /// Lifecycle states for a cross-border fiat settlement escrow.
 #[contracttype]
@@ -563,6 +582,72 @@ impl TimeLockedUpgradeContract {
         // #439: write treasury once at deployment; never overwritten
         env.storage().instance().set(&TREASURY_KEY, &treasury);
         Ok(())
+    }
+
+    /// Record a TWAP observation for `asset` at the current ledger timestamp.
+    ///
+    /// Observations feed the dynamic sample-window inspector (issue #1020).
+    pub fn record_twap_observation(
+        env: Env,
+        asset: Symbol,
+        price: i128,
+    ) -> Result<(), ContractError> {
+        if price <= 0 {
+            return Err(ContractError::InvalidArgument);
+        }
+        crate::twap_window::record_observation(&env, &asset, price, env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Inspect the dynamic TWAP sample window for `asset` without failing.
+    ///
+    /// Returns the active window, sample count, realized volatility, and the
+    /// windowed TWAP. Useful for off-chain monitoring and dashboards.
+    pub fn inspect_twap_window(
+        env: Env,
+        asset: Symbol,
+    ) -> Result<crate::twap_window::TwapWindowInspection, ContractError> {
+        Ok(crate::twap_window::inspect(
+            &env,
+            asset,
+            env.ledger().timestamp(),
+        ))
+    }
+
+    /// Return the windowed TWAP price for `asset`.
+    ///
+    /// Reverts with [`ContractError::InsufficientObservations`] when the active
+    /// observation window holds fewer than `Nmin = 10` samples.
+    pub fn get_twap_price(env: Env, asset: Symbol) -> Result<i128, ContractError> {
+        let inspection = crate::twap_window::enforce(&env, asset, env.ledger().timestamp())?;
+        Ok(inspection.twap)
+    }
+
+    /// Read the active TWAP window configuration for an asset.
+    pub fn get_twap_window_config(
+        env: Env,
+        asset: Symbol,
+    ) -> crate::twap_window::TwapWindowConfig {
+        crate::twap_window::get_config(&env, &asset)
+    }
+
+    /// Set the TWAP window configuration for an asset. Admin only.
+    pub fn set_twap_window_config(
+        env: Env,
+        admin: Address,
+        asset: Symbol,
+        config: crate::twap_window::TwapWindowConfig,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let data: ContractData = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY)
+            .ok_or(ContractError::NotInitialized)?;
+        if data.admin != admin {
+            return Err(ContractError::NotAdmin);
+        }
+        crate::twap_window::set_config(&env, &asset, &config)
     }
 
     pub fn stake_and_register(env: Env, node: Address, amount: u64) -> Result<StakeRecord, ContractError> {
@@ -814,10 +899,10 @@ impl TimeLockedUpgradeContract {
         executor.require_auth();
         consume_nonce(&env, &executor, nonce, salt, signature)?;
         let pending: StagedUpgrade = env.storage().instance().get(&PENDING_UPGRADE_KEY).ok_or(ContractError::NoPendingUpgrade)?;
-        if !verify_staged_delay(pending.staged_at, env.ledger().sequence()) {
+        if env.ledger().timestamp() < pending.execute_at {
             return Err(ContractError::UpgradeTimelockNotSatisfied);
         }
-        env.deployer().update_current_contract_wasm(pending.wasm_hash.to_array());
+        env.deployer().update_current_contract_wasm(pending.new_wasm_hash.to_array());
         env.storage().instance().remove(&PENDING_UPGRADE_KEY);
         Self::_remove_proposal_state(&env, GOVERNANCE_UPGRADE_KEY);
         crate::instance::bump_instance_ttl(&env);

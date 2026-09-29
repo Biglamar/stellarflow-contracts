@@ -1,6 +1,8 @@
 #![cfg(test)]
 
-use soroban_sdk::{testutils::Address as _, Address, Env, IntoVal, Symbol, Val, Vec};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Ledger as _, Address, Env, IntoVal, Symbol, Val, Vec,
+};
 use stellarflow_contracts::{
     orders::limit::AssetPair,
     vaults::interest::{InterestRateConfig, PoolState},
@@ -122,4 +124,76 @@ fn test_auth_context_isolation_guard() {
         &args,
     );
     assert!(result.is_ok());
+}
+
+// ============================================================================
+// Issue #1020: TWAP Oracle Dynamic Sample Window Inspector
+// ============================================================================
+
+/// Pricing must revert while fewer than `Nmin = 10` observations are present.
+#[test]
+fn test_twap_price_reverts_below_min_observations() {
+    let (env, client, _) = setup_env();
+    let asset = Symbol::new(&env, "XLM");
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = 1_000_000;
+    });
+    for _ in 0..9 {
+        client.record_twap_observation(&asset, &1_000);
+    }
+
+    let inspection = client.inspect_twap_window(&asset);
+    assert_eq!(inspection.sample_count, 9);
+    assert!(!inspection.sufficient);
+
+    // Pricing call must fail closed on the thin sample set.
+    assert!(client.try_get_twap_price(&asset).is_err());
+}
+
+/// Pricing succeeds once exactly `Nmin = 10` observations are present.
+#[test]
+fn test_twap_price_succeeds_at_min_observations() {
+    let (env, client, _) = setup_env();
+    let asset = Symbol::new(&env, "XLM");
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = 1_000_000;
+    });
+    for _ in 0..10 {
+        client.record_twap_observation(&asset, &2_000);
+    }
+
+    let inspection = client.inspect_twap_window(&asset);
+    assert!(inspection.sufficient);
+    assert_eq!(inspection.window_secs, 900);
+    assert_eq!(client.get_twap_price(&asset), 2_000);
+}
+
+/// High volatility expands the observation window from 15 to 60 minutes.
+#[test]
+fn test_twap_window_expands_during_high_volatility() {
+    let (env, client, _) = setup_env();
+    let asset = Symbol::new(&env, "XLM");
+    let base = 1_000_000u64;
+
+    // Twelve observations spaced 5 minutes apart (~55 min span) with 10 %
+    // tick-to-tick moves push realized volatility well above the threshold.
+    let mut price = 1_000i128;
+    for i in 0..12u64 {
+        env.ledger().with_mut(|li| {
+            li.timestamp = base - 3_300 + i * 300;
+        });
+        client.record_twap_observation(&asset, &price);
+        price += price / 10;
+    }
+    env.ledger().with_mut(|li| {
+        li.timestamp = base;
+    });
+
+    let inspection = client.inspect_twap_window(&asset);
+    assert!(inspection.high_volatility);
+    assert_eq!(inspection.window_secs, 3_600);
+    assert_eq!(inspection.sample_count, 12);
+    assert!(inspection.sufficient);
 }

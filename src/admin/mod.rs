@@ -1,42 +1,6 @@
-pub mod cleanup {
-    use super::*;
-
-    pub fn cleanup_expired_proposals(env: &Env) -> Result<u32, ContractError> {
-        super::prune::prune_expired_keys(env, super::prune::PruneTarget::EmergencyRevocation)
-    }
-
-    pub fn reclaim_expired_proposal_deposit(env: &Env, maker: &Address) -> Result<u32, ContractError> {
-        maker.require_auth();
-        cleanup_expired_proposals(env)
-    }
-}
-
-pub mod prune {
-    use super::*;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum PruneTarget {
-        EmergencyRevocation,
-    }
-
-    pub fn prune_expired_keys(env: &Env, target: PruneTarget) -> Result<u32, ContractError> {
-        let mut pruned = 0u32;
-        match target {
-            PruneTarget::EmergencyRevocation => {
-                if let Some(proposal) = get_temp_proposal::<EmergencyRevocationProposal>(
-                    env,
-                    &EMERGENCY_REVOCATION_TEMP_KEY,
-                ) {
-                    if proposal_state(env, proposal.proposed_at) == ProposalState::Expired {
-                        remove_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY);
-                        pruned += 1;
-                    }
-                }
-            }
-        }
-        Ok(pruned)
-    }
-}
+pub mod action_queue;
+pub mod cleanup;
+pub mod prune;
 
 pub use action_queue::{
     cancel_action, execute_action, get_action_timelock_remaining, get_queued_action,

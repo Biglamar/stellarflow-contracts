@@ -21,13 +21,21 @@
 //! emit_event(env, EventName::PriceUpdate, &[&asset_sym], &(price, timestamp));
 //! ```
 
-use soroban_sdk::{symbol_short, Env, Symbol, Vec};
+use alloc::format;
+use soroban_sdk::{contracttype, symbol_short, Env, Symbol, Vec};
 
 use crate::ContractError;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/// Flash-loan fee distribution event topic.
+pub const EV_FLASH_FEES_DISTRIBUTED: Symbol = symbol_short!("flashfee");
+/// Governance proposal creation event topic.
+pub const EV_PROPOSAL_CREATED: Symbol = symbol_short!("propcrea");
+/// Adaptive-fee change event topic.
+pub const EV_ADAPTIVE_FEE: Symbol = symbol_short!("afee");
 
 /// Maximum number of indexed Symbol topics allowed per event.
 /// RPC `getEvents` queries filter on topic vectors; keeping this bounded
