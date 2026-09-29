@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
-soroban-sdk = { workspace = true, default-features = false }
+soroban-sdk = { workspace = true, default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, default-features = false, features = ["testutils"] }

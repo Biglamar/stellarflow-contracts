@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec,
 };
 
 /// Errors emitted when invariant checks fail.
@@ -20,6 +20,8 @@ pub enum InvariantError {
     Overflow = 9,
     DelegationCycleDetected = 10,
     InvalidDelegate = 11,
+    IdentityNotVerified = 12,
+    SybilDetected = 13,
 }
 
 /// Per-user voting weight lock record.
@@ -32,6 +34,15 @@ pub struct VotingWeightLock {
     pub lock_ledger: u32,
 }
 
+/// Quadratic voting power record for a user.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuadraticVotingPower {
+    pub user: Address,
+    pub raw_weight: i128,
+    pub scaled_power: i128,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -39,6 +50,9 @@ pub enum DataKey {
     UserWeight(Address),
     Delegate(Address),
     DelegatedWeight(Address),
+    VerifiedIdentity(Address),
+    DelegationRecord(Address),
+    QuadraticPower(Address),
 }
 
 #[contract]
@@ -49,6 +63,29 @@ pub struct GovernanceInvariantsContract;
 /// In production this could be time-weighted (veTOKEN model).
 fn compute_weight(locked_amount: i128) -> i128 {
     locked_amount
+}
+
+/// Compute the integer square root of `n` using Newton's method.
+/// Returns the largest integer `r` such that `r * r <= n`.
+fn isqrt(n: i128) -> i128 {
+    if n <= 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
+/// Compute effective quadratic voting power: V_effective = sqrt(W_ve).
+fn compute_quadratic_power(weight: i128) -> i128 {
+    if weight <= 0 {
+        return 0;
+    }
+    isqrt(weight)
 }
 
 fn get_delegate(env: &Env, user: &Address) -> Option<Address> {
@@ -80,6 +117,37 @@ fn set_delegated_weight(env: &Env, user: &Address, weight: i128) {
     env.storage()
         .instance()
         .set(&DataKey::DelegatedWeight(user.clone()), &weight);
+}
+
+fn is_identity_verified(env: &Env, user: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::VerifiedIdentity(user.clone()))
+        .unwrap_or(false)
+}
+
+fn set_identity_verified(env: &Env, user: &Address, verified: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::VerifiedIdentity(user.clone()), &verified);
+}
+
+fn get_delegation_record(env: &Env, user: &Address) -> Option<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::DelegationRecord(user.clone()))
+}
+
+fn set_delegation_record(env: &Env, user: &Address, delegatee: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKey::DelegationRecord(user.clone()), delegatee);
+}
+
+fn remove_delegation_record(env: &Env, user: &Address) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::DelegationRecord(user.clone()));
 }
 
 fn propagate_delegated_weight(
@@ -120,6 +188,28 @@ impl GovernanceInvariantsContract {
         Ok(())
     }
 
+    /// Register a verified identity for a user to prevent sybil attacks.
+    /// Only the admin can verify identities.
+    pub fn verify_identity(
+        env: Env,
+        admin: Address,
+        user: Address,
+    ) -> Result<(), InvariantError> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(InvariantError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(InvariantError::NotAdmin);
+        }
+        set_identity_verified(&env, &user, true);
+        env.events()
+            .publish((symbol_short!("identity"),), (user, true));
+        Ok(())
+    }
+
     /// Lock tokens and register a user's voting weight.
     /// Runs invariant checks before and after the action.
     ///
@@ -148,6 +238,10 @@ impl GovernanceInvariantsContract {
             return Err(InvariantError::LockAlreadyExists);
         }
 
+        if !is_identity_verified(&env, &user) {
+            return Err(InvariantError::IdentityNotVerified);
+        }
+
         let lock = VotingWeightLock {
             user: user.clone(),
             locked_amount: amount,
@@ -169,6 +263,17 @@ impl GovernanceInvariantsContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalVotingWeight, &new_total);
+
+        // Compute and store quadratic power
+        let scaled_power = compute_quadratic_power(weight);
+        let qvp = QuadraticVotingPower {
+            user: user.clone(),
+            raw_weight: weight,
+            scaled_power,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::QuadraticPower(user.clone()), &qvp);
 
         // Post-action invariant check (panics on drift)
         Self::assert_invariant_holds(&env)?;
@@ -233,6 +338,17 @@ impl GovernanceInvariantsContract {
             .instance()
             .set(&DataKey::TotalVotingWeight, &new_total);
 
+        // Update quadratic power
+        let scaled_power = compute_quadratic_power(new_weight);
+        let qvp = QuadraticVotingPower {
+            user: user.clone(),
+            raw_weight: new_weight,
+            scaled_power,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::QuadraticPower(user.clone()), &qvp);
+
         // Propagate weight if the user has delegated
         propagate_delegated_weight(&env, &user, delta)?;
 
@@ -266,6 +382,10 @@ impl GovernanceInvariantsContract {
 
         if weight_to_delegate <= 0 {
             return Err(InvariantError::InvalidAmount);
+        }
+
+        if !is_identity_verified(&env, &delegator) || !is_identity_verified(&env, &delegatee) {
+            return Err(InvariantError::IdentityNotVerified);
         }
 
         // Pre-action invariant check
@@ -318,6 +438,10 @@ impl GovernanceInvariantsContract {
             (delegator, delegatee, weight_to_delegate),
         );
 
+        // Update quadratic power for both parties
+        Self::update_quadratic_power(&env, &delegator_lock.user)?;
+        Self::update_quadratic_power(&env, &delegatee_lock.user)?;
+
         Ok(())
     }
 
@@ -337,6 +461,10 @@ impl GovernanceInvariantsContract {
             .instance()
             .get(&delegator_key)
             .ok_or(InvariantError::NoLockFound)?;
+
+        if !is_identity_verified(&env, &delegator) {
+            return Err(InvariantError::IdentityNotVerified);
+        }
 
         let is_reclaim = to_address == delegator;
 
@@ -404,8 +532,13 @@ impl GovernanceInvariantsContract {
         // 2. Set delegate or reclaim
         if is_reclaim {
             remove_delegate(&env, &delegator);
+            remove_delegation_record(&env, &delegator);
         } else {
+            if !is_identity_verified(&env, &to_address) {
+                return Err(InvariantError::IdentityNotVerified);
+            }
             set_delegate(&env, &delegator, &to_address);
+            set_delegation_record(&env, &delegator, &to_address);
 
             // Add total_weight_to_shift to new delegate path
             let mut current = to_address.clone();
@@ -452,6 +585,9 @@ impl GovernanceInvariantsContract {
             (to_delegate, total_weight_to_shift),
         );
 
+        // Update quadratic power for delegator
+        Self::update_quadratic_power(&env, &delegator)?;
+
         Ok(())
     }
 
@@ -474,6 +610,81 @@ impl GovernanceInvariantsContract {
         own_weight + delegated_weight
     }
 
+    /// Get the quadratic voting power of `user`.
+    /// Returns V_effective = sqrt(W_ve) where W_ve is the locked token weight.
+    pub fn get_quadratic_voting_power(env: Env, user: Address) -> i128 {
+        let raw_weight = Self::get_voting_power(env.clone(), user.clone(), 0);
+        compute_quadratic_power(raw_weight)
+    }
+
+    /// Get the stored quadratic voting power record for `user`.
+    pub fn get_quadratic_power_record(
+        env: Env,
+        user: Address,
+    ) -> Option<QuadraticVotingPower> {
+        env.storage()
+            .instance()
+            .get(&DataKey::QuadraticPower(user))
+    }
+
+    /// Cast a quadratic vote on a governance proposal.
+    /// Computes effective voting power as sqrt(weight) and emits
+    /// `QuadraticVoteCast` event with raw weight and scaled power.
+    pub fn cast_quadratic_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u32,
+        support: bool,
+    ) -> Result<QuadraticVotingPower, InvariantError> {
+        voter.require_auth();
+
+        if !is_identity_verified(&env, &voter) {
+            return Err(InvariantError::IdentityNotVerified);
+        }
+
+        // Reclaim delegated power if voter is voting directly
+        Self::checkpoint_reclaim_on_vote(env.clone(), voter.clone())?;
+
+        let raw_weight = Self::get_voting_power(env.clone(), voter.clone(), 0);
+        if raw_weight <= 0 {
+            return Err(InvariantError::InvalidAmount);
+        }
+
+        let scaled_power = compute_quadratic_power(raw_weight);
+
+        let qvp = QuadraticVotingPower {
+            user: voter.clone(),
+            raw_weight,
+            scaled_power,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::QuadraticPower(voter.clone()), &qvp);
+
+        // Emit QuadraticVoteCast event containing raw weight and scaled power
+        env.events().publish(
+            (symbol_short!("QuadVote"), voter.clone(), proposal_id),
+            (raw_weight, scaled_power, support),
+        );
+
+        Ok(qvp)
+    }
+
+    /// Internal helper: recompute and store quadratic power for a user.
+    fn update_quadratic_power(env: &Env, user: &Address) -> Result<(), InvariantError> {
+        let raw_weight = Self::get_voting_power(env.clone(), user.clone(), 0);
+        let scaled_power = compute_quadratic_power(raw_weight);
+        let qvp = QuadraticVotingPower {
+            user: user.clone(),
+            raw_weight,
+            scaled_power,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::QuadraticPower(user.clone()), &qvp);
+        Ok(())
+    }
+
     /// Checkpoints/reclaims a voter's delegated power back to themselves if they vote directly.
     pub fn checkpoint_reclaim_on_vote(env: Env, voter: Address) -> Result<(), InvariantError> {
         if let Some(delegate) = get_delegate(&env, &voter) {
@@ -482,6 +693,11 @@ impl GovernanceInvariantsContract {
             }
         }
         Ok(())
+    }
+
+    /// Check if a user's identity has been verified.
+    pub fn is_verified(env: Env, user: Address) -> bool {
+        is_identity_verified(&env, &user)
     }
 
     /// Get the stored total voting weight.
