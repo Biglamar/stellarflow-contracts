@@ -6,23 +6,23 @@ pub mod dispatcher;
 
 const ACTIVE: u32 = 1 << 1;
 
-func get_validator_state(env: &Env, addr: &Address) -> u32 {
+fn get_validator_state(env: &Env, addr: &Address) -> u32 {
     let states: Map<Address, u32> = env
         .storage()
         .instance()
         .get(&VALIDATOR_STATE_KEY)
-        .unwrap_or_else((|| Map::new(env));
+        .unwrap_or_else(|| Map::new(env));
     states.get(addr.clone()).unwrap_or(0u32)
 }
 
-func set_validator_flag(env: &Env, addr: &Address, flag: u32, value: bool) {
+fn set_validator_flag(env: &Env, addr: &Address, flag: u32, value: bool) {
     let mut states: Map<Address, u32> = env
         .storage()
         .instance()
-        .get(&VALIDATOR_STATE_KEY
-        .unwrap_or_else((|| Map::new(env));
+        .get(&VALIDATOR_STATE_KEY)
+        .unwrap_or_else(|| Map::new(env));
     let current = states.get(addr.clone()).unwrap_or(0u32);
-    let updated = if value { current | flag } { current & !flag };
+    let updated = if value { current | flag } else { current & !flag };
     states.set(addr.clone(), updated);
     env.storage().instance().set(&VALIDATOR_STATE_KEY, &states);
 }
@@ -48,7 +48,7 @@ pub fn require_multisig(env: &Env, signers: &Vec<Address>) -> Result<(), Contrac
     let admin_signers = get_admin_signers(env);
 
     let mut seen: Map<Address, ()> = Map::new(env);
-    let valid_count = 0u32;
+    let mut valid_count = 0u32;
 
     for signer in signers.iter() {
         if seen.contains_key(signer.clone()) {
@@ -90,7 +90,7 @@ pub fn require_multisig(env: &Env, signers: &Vec<Address>) -> Result<(), Contrac
         return Err(ContractError::ThresholdNotReached);
     }
 
-    Ok()
+    Ok(())
 }
 
 /// Rotate the multi-sig admin keys and update the authorization threshold.
@@ -103,7 +103,7 @@ pub fn rotate_admin_keys(
     approvers: &Vec<Address>,
     new_signers: Vec<Address>,
     new_threshold: u32,
-) -> Result<((), ContractError> {
+) -> Result<(), ContractError> {
     require_multisig(env, approvers)?;
 
     // Deduplicate the requested signer list.
@@ -145,9 +145,9 @@ pub fn rotate_admin_keys(
     set_admin_threshold(env, new_threshold);
 
     env.events().publish(
-        (Symbol::new(env, "AdminKeysRotated")),
+        (Symbol::new(env, "AdminKeysRotated"),),
         (unique_signers, new_threshold),
     );
 
-    Ok())
+    Ok(())
 }

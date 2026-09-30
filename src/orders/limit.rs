@@ -55,8 +55,6 @@ pub struct LimitOrder {
     /// Expiry ledger sequence; zero means the order does not expire.
     pub expiry: u32,
     pub active: bool,
-    /// Bid (Buy) or ask (Sell) side of the book.
-    pub side: OrderSide,
 }
 
 #[contracttype]
@@ -285,7 +283,6 @@ pub fn place_order_with_expiry(
         created_at_ledger: env.ledger().sequence(),
         expiry,
         active: true,
-        side: OrderSide::Sell,
     };
 
     save_order(env, &order);
@@ -333,7 +330,6 @@ pub fn place_buy_order(
         created_at_ledger: env.ledger().sequence(),
         expiry: 0,
         active: true,
-        side: OrderSide::Buy,
     };
 
     save_order(env, &order);
@@ -1104,7 +1100,8 @@ pub fn enforce_fallback_pricing(env: &Env, pair: &AssetPair, base_price: i128) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::TryFromVal;
 
     fn setup() -> (Env, crate::TimeLockedUpgradeContractClient<'static>, Address, Address, Address) {
         let env = Env::default();
@@ -1380,10 +1377,10 @@ mod tests {
         assert_eq!(best_bid, Some(PRICE_SCALE));
         assert_eq!(best_ask, Some((PRICE_SCALE * 101) / 100));
 
-        let ratio = client.calculate_spread_ratio(&pair).unwrap();
+        let ratio = client.calculate_spread_ratio(&pair);
         assert_eq!(ratio, PRICE_SCALE / 100);
 
-        let spread = client.check_spread_imbalance(&pair).unwrap();
+        let spread = client.check_spread_imbalance(&pair);
         assert!(spread.has_liquidity);
         assert_eq!(spread.best_bid, PRICE_SCALE);
         assert_eq!(spread.best_ask, (PRICE_SCALE * 101) / 100);
@@ -1403,7 +1400,7 @@ mod tests {
         client.place_limit_order(&seller, &pair, &((PRICE_SCALE * 110) / 100), &1_000);
         client.place_buy_limit_order(&buyer, &pair, &PRICE_SCALE, &1_000);
 
-        let spread = client.check_spread_imbalance(&pair).unwrap();
+        let spread = client.check_spread_imbalance(&pair);
         assert!(spread.spread_ratio > SPREAD_ALERT_THRESHOLD);
 
         let mut alert_seen = false;
@@ -1412,7 +1409,8 @@ mod tests {
             let (_, topics, _) = events.get(i).unwrap();
             if topics
                 .get(1)
-                == Some(soroban_sdk::Symbol::new(&env, "liquidity_provider_alert").into_val(&env))
+                .and_then(|v| soroban_sdk::Symbol::try_from_val(&env, &v).ok())
+                == Some(soroban_sdk::Symbol::new(&env, "liquidity_provider_alert"))
             {
                 alert_seen = true;
             }
@@ -1433,7 +1431,7 @@ mod tests {
         client.place_limit_order(&seller, &pair, &((PRICE_SCALE * 102) / 100), &1_000);
         client.place_buy_limit_order(&buyer, &pair, &PRICE_SCALE, &1_000);
 
-        let spread = client.check_spread_imbalance(&pair).unwrap();
+        let spread = client.check_spread_imbalance(&pair);
         assert!(spread.spread_ratio <= SPREAD_ALERT_THRESHOLD);
 
         let events = env.events().all();
@@ -1442,7 +1440,8 @@ mod tests {
             let (_, topics, _) = events.get(i).unwrap();
             if topics
                 .get(1)
-                == Some(soroban_sdk::Symbol::new(&env, "liquidity_provider_alert").into_val(&env))
+                .and_then(|v| soroban_sdk::Symbol::try_from_val(&env, &v).ok())
+                == Some(soroban_sdk::Symbol::new(&env, "liquidity_provider_alert"))
             {
                 alert_seen = true;
             }
@@ -1462,7 +1461,7 @@ mod tests {
         assert!(client.is_liquidity_thin(&pair));
 
         let base = 10 * PRICE_SCALE;
-        let fallback = client.enforce_fallback_pricing(&pair, &base).unwrap();
+        let fallback = client.enforce_fallback_pricing(&pair, &base);
         assert!(fallback > base);
 
         // Adding both sides with real depth un-thins the book.
@@ -1470,7 +1469,7 @@ mod tests {
         mint(&env, &pair.buy_asset, &buyer, 200_000);
         client.place_buy_limit_order(&buyer, &pair, &PRICE_SCALE, &2_000);
         assert!(!client.is_liquidity_thin(&pair));
-        assert_eq!(client.enforce_fallback_pricing(&pair, &base).unwrap(), base);
+        assert_eq!(client.enforce_fallback_pricing(&pair, &base), base);
     }
 
     #[test]
@@ -1481,7 +1480,7 @@ mod tests {
         let pair = AssetPair { sell_asset, buy_asset };
         client.place_limit_order(&seller, &pair, &PRICE_SCALE, &1_000);
 
-        let spread = client.check_spread_imbalance(&pair).unwrap();
+        let spread = client.check_spread_imbalance(&pair);
         assert!(!spread.has_liquidity);
         assert_eq!(spread.spread_ratio, 0);
     }

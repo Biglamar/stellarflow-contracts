@@ -5,12 +5,54 @@
 // It also provides helper functions for node profile management, subscription
 // rent extension, and asset price TTL management.
 use crate::NodeProfile;
-use soroban_sdk::{contracttype, Address, Env, Map, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol, Vec, xdr::ToXdr};
+
+pub mod ephemeral;
+
+/// Strict 10k/100k TTL policy: extend when remaining TTL drops below the
+/// threshold, topping up to the bump amount.
+pub const THRESHOLD: u32 = 10_000;
+pub const BUMP_AMOUNT: u32 = 100_000;
+/// TTL threshold (in ledgers) applied to persistent storage entries.
+pub const PERSISTENT_TTL_THRESHOLD: u32 = 100_000;
+/// TTL target (in ledgers) applied when extending subscription entries.
+pub const RENT_THRESHOLD: u32 = 10_000;
+pub const RENT_EXTEND_TO: u32 = 100_000;
+/// TTL target (in ledgers) applied by the pre-flight asset rent check.
+pub const ASET_TTL_THRESHOLD: u32 = 100_000;
+
+pub(crate) const ADMIN_SIGNERS_KEY: Symbol = symbol_short!("ADMNSGN");
+pub(crate) const ADMIN_THRESHOLD_KEY: Symbol = symbol_short!("ADMNTHR");
+
+pub fn get_admin_signers(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&ADMIN_SIGNERS_KEY)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+pub fn set_admin_signers(env: &Env, signers: Vec<Address>) {
+    env.storage().instance().set(&ADMIN_SIGNERS_KEY, &signers);
+}
+
+pub fn get_admin_threshold(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&ADMIN_THRESHOLD_KEY)
+        .unwrap_or(1u32)
+}
+
+pub fn set_admin_threshold(env: &Env, threshold: u32) {
+    env.storage()
+        .instance()
+        .set(&ADMIN_THRESHOLD_KEY, &threshold);
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Subscription(Address),
+    AssetPrice(Symbol),
 }
 
 /// NOTE: These are single-variant enums, not bare tuple structs. A single-field
@@ -259,28 +301,32 @@ impl KeyOptimizer {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{Env, Address};
 
     #[test]
     fn test_strict_ttl_extension_survival() {
         let env = Env::default();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
         let test_address = Address::generate(&env);
         let key = DataKey::Subscription(test_address.clone());
         
         // Initial setup
-        env.storage().persistent().set(&key, &true);
-        extend_persistent_ttl(&env, &key);
+        env.as_contract(&contract_id, || env.storage().persistent().set(&key, &true));
+        env.as_contract(&contract_id, || extend_persistent_ttl(&env, &key));
 
         // Jump to 95,000 ledgers (within the 10,000 threshold of initial 100k bump)
-        env.ledger().set_sequence(95_000);
-        assert!(env.storage().persistent().has(&key));
+        env.ledger().with_mut(|li| li.sequence_number = 95_000);
+        assert!(env.as_contract(&contract_id, || env.storage().persistent().has(&key)));
 
         // Trigger secondary bump
-        extend_persistent_ttl(&env, &key);
+        env.as_contract(&contract_id, || extend_persistent_ttl(&env, &key));
 
         // Jump to 150,000 ledgers. Without the secondary bump, it would have expired at 100k.
-        env.ledger().set_sequence(150_000);
-        assert!(env.storage().persistent().has(&key), "Storage should survive via 100k bump");
+        env.ledger().with_mut(|li| li.sequence_number = 150_000);
+        assert!(
+            env.as_contract(&contract_id, || env.storage().persistent().has(&key)),
+            "Storage should survive via 100k bump"
+        );
     }
 }
