@@ -5,3 +5,4 @@ pub mod pause_guard;
 pub mod autocompound;
 pub mod harvest_compound;
 pub mod interest;
+pub mod yield_strategy;

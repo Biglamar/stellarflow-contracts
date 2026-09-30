@@ -306,6 +306,9 @@ impl ContractError {
     pub const HarvestSwapFailed: Self = Self::RouteExecutionFailed;
     pub const HarvestSlippageExceeded: Self = Self::SlippageExceeded;
     pub const HarvestInvalidPath: Self = Self::InconsistentRouteAssets;
+    pub const StrategyInvalidPairToken: Self = Self::InvalidAsset;
+    pub const StrategyInvalidReserves: Self = Self::InsufficientLiquidityDepth;
+    pub const StrategyYieldNotPositive: Self = Self::AmountTooLow;
 
     // ── Issue #720 canonical API error aliases ────────────────────────────────
     // These four names are the stable external-facing identifiers documented in
@@ -1978,6 +1981,27 @@ impl TimeLockedUpgradeContract {
     ) -> Result<vaults::harvest_compound::HarvestCompoundResult, ContractError> {
         let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
         vaults::harvest_compound::harvest_and_compound(&env, user, router, path, min_lp_out)
+    }
+
+    // ── Auto-compounding yield farm strategy (Issue #911) ────────────────────
+
+    /// Claim accrued farm rewards, swap the optimal single-sided share into
+    /// `pair_token`, add both legs as pool liquidity through `router`, and
+    /// re-stake the LP received — atomically. `min_lp_out` is the caller's
+    /// slippage floor on the measured LP delta, and the round must strictly
+    /// grow the caller's staked position.
+    ///
+    /// As with `harvest_and_compound`, this guard is the only one on the path
+    /// and must hold across the untrusted `router` calls.
+    pub fn compound_yield_strategy(
+        env: Env,
+        user: Address,
+        router: Address,
+        pair_token: Address,
+        min_lp_out: i128,
+    ) -> Result<vaults::yield_strategy::StrategyCompoundResult, ContractError> {
+        let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
+        vaults::yield_strategy::compound_strategy(&env, user, router, pair_token, min_lp_out)
     }
 
     // ── On-chain limit order book (Issue #701) ───────────────────────────────
