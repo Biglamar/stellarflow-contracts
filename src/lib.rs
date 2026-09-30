@@ -76,6 +76,7 @@ pub mod kernel;
 pub use kernel::instance;
 pub mod errors;
 pub mod events;
+pub mod expiry;
 pub mod fees;
 pub mod temp_governance;
 use crate::validation::check_bond_capacity;
