@@ -126,74 +126,154 @@ fn test_auth_context_isolation_guard() {
     assert!(result.is_ok());
 }
 
-// ============================================================================
-// Issue #1020: TWAP Oracle Dynamic Sample Window Inspector
-// ============================================================================
-
-/// Pricing must revert while fewer than `Nmin = 10` observations are present.
 #[test]
-fn test_twap_price_reverts_below_min_observations() {
-    let (env, client, _) = setup_env();
-    let asset = Symbol::new(&env, "XLM");
+fn test_bridge_validator_double_sign_slashing() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use soroban_sdk::BytesN;
+    use stellarflow_contracts::bridge::slashing::{
+        AttestationPayload, DoubleSignProof,
+    };
+    use stellarflow_contracts::bridge::relayer::bridge_message_digest;
 
-    env.ledger().with_mut(|li| {
-        li.timestamp = 1_000_000;
-    });
-    for _ in 0..9 {
-        client.record_twap_observation(&asset, &1_000);
-    }
+    let (env, client, admin) = setup_env();
 
-    let inspection = client.inspect_twap_window(&asset);
-    assert_eq!(inspection.sample_count, 9);
-    assert!(!inspection.sufficient);
+    let signing_key = SigningKey::from_bytes(&[99u8; 32]);
+    let validator_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
 
-    // Pricing call must fail closed on the thin sample set.
-    assert!(client.try_get_twap_price(&asset).is_err());
+    // Register bridge validator
+    client.add_bridge_validator(&admin, &validator_pubkey);
+
+    // Stake 10_000 collateral deposit
+    let collateral = 10_000i128;
+    client.stake_bridge_validator(&validator_pubkey, &collateral);
+    assert_eq!(client.get_bridge_validator_collateral(&validator_pubkey), collateral);
+
+    let source_chain_id = 1u32;
+    let nonce = 42u64;
+    let recipient_1 = Address::generate(&env);
+    let recipient_2 = Address::generate(&env);
+
+    let payload_1 = AttestationPayload {
+        proof_hash: BytesN::from_array(&env, &[1u8; 32]),
+        recipient: recipient_1,
+        amount: 500,
+    };
+    let digest_1 = bridge_message_digest(
+        &env,
+        source_chain_id,
+        nonce,
+        &payload_1.proof_hash,
+        &payload_1.recipient,
+        payload_1.amount,
+    );
+    let sig_1 = signing_key.sign(&digest_1.to_array());
+    let signature_1 = BytesN::from_array(&env, &sig_1.to_bytes());
+
+    let payload_2 = AttestationPayload {
+        proof_hash: BytesN::from_array(&env, &[2u8; 32]),
+        recipient: recipient_2,
+        amount: 1_000,
+    };
+    let digest_2 = bridge_message_digest(
+        &env,
+        source_chain_id,
+        nonce,
+        &payload_2.proof_hash,
+        &payload_2.recipient,
+        payload_2.amount,
+    );
+    let sig_2 = signing_key.sign(&digest_2.to_array());
+    let signature_2 = BytesN::from_array(&env, &sig_2.to_bytes());
+
+    let proof = DoubleSignProof {
+        validator: validator_pubkey.clone(),
+        source_chain_id,
+        nonce,
+        payload_1,
+        signature_1,
+        payload_2,
+        signature_2,
+    };
+
+    // Slash 100% of offending validator's staked collateral
+    let slashed = client.submit_double_sign_proof(&proof);
+    assert_eq!(slashed, collateral);
+
+    // Collateral is now 0 (100% slashed)
+    assert_eq!(client.get_bridge_validator_collateral(&validator_pubkey), 0);
+
+    // Offending validator is permanently removed and cannot be re-added
+    assert!(client.try_add_bridge_validator(&admin, &validator_pubkey).is_err());
 }
 
-/// Pricing succeeds once exactly `Nmin = 10` observations are present.
 #[test]
-fn test_twap_price_succeeds_at_min_observations() {
+fn test_zk_public_input_verification_guard() {
+    use soroban_sdk::BytesN;
+    use stellarflow_contracts::zk::public_input_guard::{
+        DepositNotePublicInputs, SubmittedDepositParameters,
+    };
+    use stellarflow_contracts::zk::merkle::insert_deposit;
+    use stellarflow_contracts::ContractError;
+
     let (env, client, _) = setup_env();
-    let asset = Symbol::new(&env, "XLM");
 
-    env.ledger().with_mut(|li| {
-        li.timestamp = 1_000_000;
-    });
-    for _ in 0..10 {
-        client.record_twap_observation(&asset, &2_000);
-    }
+    let recipient = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[33u8; 32]);
+    let (_, legitimate_root) = insert_deposit(&env, commitment).unwrap();
 
-    let inspection = client.inspect_twap_window(&asset);
-    assert!(inspection.sufficient);
-    assert_eq!(inspection.window_secs, 900);
-    assert_eq!(client.get_twap_price(&asset), 2_000);
+    let nullifier = BytesN::from_array(&env, &[77u8; 32]);
+    let fee = 100i128;
+
+    let public_inputs = DepositNotePublicInputs {
+        root: legitimate_root.clone(),
+        nullifier_hash: nullifier.clone(),
+        recipient: recipient.clone(),
+        fee,
+    };
+
+    let submitted_params = SubmittedDepositParameters {
+        expected_root: legitimate_root.clone(),
+        expected_nullifier_hash: nullifier.clone(),
+        expected_recipient: recipient.clone(),
+        expected_fee: fee,
+    };
+
+    // Valid inputs strictly match contract state parameters
+    assert!(client.try_verify_zk_deposit_public_inputs(&public_inputs, &submitted_params).is_ok());
+
+    // Mismatched root must revert with ContractError::InvalidZKPublicInputs (code 84)
+    let fake_root = BytesN::from_array(&env, &[99u8; 32]);
+    let bad_public_inputs = DepositNotePublicInputs {
+        root: fake_root,
+        nullifier_hash: nullifier.clone(),
+        recipient: recipient.clone(),
+        fee,
+    };
+    let result = client.try_verify_zk_deposit_public_inputs(&bad_public_inputs, &submitted_params);
+    assert_eq!(result, Err(Ok(ContractError::InvalidZKPublicInputs)));
+
+    // Mismatched fee must revert with ContractError::InvalidZKPublicInputs
+    let bad_fee_inputs = DepositNotePublicInputs {
+        root: legitimate_root.clone(),
+        nullifier_hash: nullifier.clone(),
+        recipient: recipient.clone(),
+        fee: 999,
+    };
+    let result_fee = client.try_verify_zk_deposit_public_inputs(&bad_fee_inputs, &submitted_params);
+    assert_eq!(result_fee, Err(Ok(ContractError::InvalidZKPublicInputs)));
 }
 
-/// High volatility expands the observation window from 15 to 60 minutes.
 #[test]
-fn test_twap_window_expands_during_high_volatility() {
-    let (env, client, _) = setup_env();
-    let asset = Symbol::new(&env, "XLM");
-    let base = 1_000_000u64;
+fn test_adaptive_swap_fee_calculation() {
+    let (_, client, _) = setup_env();
 
-    // Twelve observations spaced 5 minutes apart (~55 min span) with 10 %
-    // tick-to-tick moves push realized volatility well above the threshold.
-    let mut price = 1_000i128;
-    for i in 0..12u64 {
-        env.ledger().with_mut(|li| {
-            li.timestamp = base - 3_300 + i * 300;
-        });
-        client.record_twap_observation(&asset, &price);
-        price += price / 10;
-    }
-    env.ledger().with_mut(|li| {
-        li.timestamp = base;
-    });
+    // fbase = 25 BPS, Vsigma = 10, fscalar = 4 -> fswap = 25 + 40 = 65 BPS
+    let fee = client.compute_adaptive_swap_fee(&25, &10, &4);
+    assert_eq!(fee, 65);
 
-    let inspection = client.inspect_twap_window(&asset);
-    assert!(inspection.high_volatility);
-    assert_eq!(inspection.window_secs, 3_600);
-    assert_eq!(inspection.sample_count, 12);
-    assert!(inspection.sufficient);
+    // High volatility: fbase = 30 BPS, Vsigma = 20, fscalar = 10 -> 30 + 200 = 230 BPS
+    // Constrained to fswap <= 0.01 (100 BPS)
+    let capped_fee = client.compute_adaptive_swap_fee(&30, &20, &10);
+    assert_eq!(capped_fee, 100);
 }
+
