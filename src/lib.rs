@@ -1531,6 +1531,21 @@ impl TimeLockedUpgradeContract {
         crate::fees::set_dynamic_fee_config(&env, &caller, asset, min_fee_bps, max_fee_bps, period_seconds)
     }
 
+    /// Governance entry point to adjust the active protocol fee tier for an asset.
+    ///
+    /// Reverts with [`ContractError::ProtocolFeeCapExceeded`] when `new_fee_bps`
+    /// exceeds the hardcoded [`crate::fees::MAX_PROTOCOL_FEE_BPS`] ceiling, and
+    /// emits a [`crate::fees::ProtocolFeeChanged`] audit event recording the old
+    /// and new fee on every accepted adjustment.
+    pub fn governance_adjust_fee_tier(
+        env: Env,
+        governance: Address,
+        asset: AssetId,
+        new_fee_bps: u32,
+    ) -> Result<u32, ContractError> {
+        crate::fees::governance_adjust_fee_tier(&env, &governance, asset, new_fee_bps)
+    }
+
     /// Update volume history and get the current dynamic fee (called internally during swaps)
     pub(crate) fn update_volume_and_get_fee(env: &Env, asset: AssetId, trade_volume: u64) -> Result<u32, ContractError> {
         crate::fees::update_volume_and_adjust_fee(env, asset, trade_volume)

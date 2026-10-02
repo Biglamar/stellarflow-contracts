@@ -163,6 +163,11 @@ pub const EV_REMITTANCE_FEE_SPLIT_CALCULATED: Symbol = symbol_short!("rem_split"
 /// Protocol: adaptive fee was clamped to the hardcoded safety floor.
 pub const EV_PROTOCOL_FEE_FLOOR_ENFORCED: Symbol = symbol_short!("fee_floor");
 
+/// Protocol: a fee-adjustment transaction changed the protocol fee ceiling or
+/// the active protocol fee tier. Emitted with the asset symbol as the second
+/// topic and a `ProtocolFeeChanged` payload recording the old and new fee.
+pub const EV_PROTOCOL_FEE_CHANGED: Symbol = symbol_short!("fee_chg");
+
 /// Treasury: reserve concentration exceeded the diversification threshold and a swap plan was generated.
 pub const EV_TREASURY_DIVERSIFICATION_TRIGGERED: Symbol = symbol_short!("treas_div");
 
