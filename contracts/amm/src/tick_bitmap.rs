@@ -32,7 +32,7 @@
 
 use soroban_sdk::{contracttype, Env};
 
-use crate::{mul_high, AmmError};
+use crate::AmmError;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -278,6 +278,29 @@ pub fn next_initialized_tick(
 // Tick <-> price
 // ---------------------------------------------------------------------------
 
+/// High 128 bits of the full 256-bit product `a * b`, via a four-product
+/// `u64 x u64` decomposition (`u128::widening_mul` is still unstable).
+fn mul_high(a: u128, b: u128) -> u128 {
+    const MASK: u128 = u64::MAX as u128;
+
+    let a_lo = a & MASK;
+    let a_hi = a >> 64;
+    let b_lo = b & MASK;
+    let b_hi = b >> 64;
+
+    let p_ll = a_lo * b_lo;
+    let p_lh = a_lo * b_hi;
+    let p_hl = a_hi * b_lo;
+    let p_hh = a_hi * b_hi;
+
+    let (mid, carry_mid) = p_lh.overflowing_add(p_hl);
+    let low_carry = ((p_ll >> 64) + (mid & MASK)) >> 64;
+
+    p_hh.wrapping_add(mid >> 64)
+        .wrapping_add((carry_mid as u128) << 64)
+        .wrapping_add(low_carry)
+}
+
 /// Q64.64 multiply: `floor(a * b / 2^64)`.
 fn mul_q64(a: u128, b: u128) -> Result<u128, AmmError> {
     let hi = mul_high(a, b);
@@ -389,6 +412,18 @@ mod tests {
             diff <= exact / 1_000_000_000_000 + 2,
             "actual {actual} vs exact {exact} (diff {diff})"
         );
+    }
+
+    #[test]
+    fn mul_high_max_bounds() {
+        // (2^128 - 1)^2 = 2^256 - 2^129 + 1 -> high word = 2^128 - 2.
+        assert_eq!(mul_high(u128::MAX, u128::MAX), u128::MAX - 1);
+    }
+
+    #[test]
+    fn mul_high_small_product_is_zero() {
+        assert_eq!(mul_high(5, 7), 0);
+        assert_eq!(mul_high(1 << 64, 1 << 64), 1);
     }
 
     #[test]
