@@ -1,4 +1,5 @@
 #![no_std]
+extern crate alloc;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short,
     Address, Bytes, BytesN, Env, Map, Symbol, Vec,
@@ -69,6 +70,7 @@ pub mod amm;
 pub mod admin;
 pub mod auth;
 pub mod bridge;
+pub mod keeper;
 pub mod escrow;
 pub mod config;
 pub mod consensus;
@@ -77,13 +79,16 @@ pub use kernel::instance;
 pub mod errors;
 pub mod events;
 pub mod fees;
+pub mod flash_fee_engine;
+pub mod flash_loan_guard;
 pub mod temp_governance;
-use crate::validation::check_bond_capacity;
 pub mod governance;
+pub mod governance_upgrade;
 pub mod math;
 pub mod oracle_attestation;
 pub mod orders;
 pub mod recovery;
+pub mod remittance;
 pub mod rescue;
 pub mod roles;
 pub mod router;
@@ -94,19 +99,24 @@ pub mod staging;
 pub mod staking_tiers;
 pub mod state_verification;
 pub mod storage;
-pub mod temp_governance;
 pub mod token;
+pub mod twap_window;
+pub mod vaults;
+pub mod veto;
+pub mod voting_delegation;
 pub mod upgrades;
 pub mod validation;
+pub mod vaults;
 pub mod zk;
 pub use state_verification::{
     assert_contract_state_sanity, verify_contract_state, verify_storage_ttl_bumps,
     verify_zero_loss_accounting,
 };
 use crate::governance::{
-    calculate_collected_weight, cast_vote, close_ballot, get_ballot, get_multisig_config,
-    open_ballot, verify_staged_delay, verify_upgrade_quorum, GovernanceUpgradeProposal,
-    GovernanceUpgradeProposedEvent, StagedUpgrade, VotingBallot, GOVERNANCE_UPGRADE_KEY,
+    calculate_collected_weight, cast_vote, close_ballot, get_ballot, get_governance_proposal,
+    get_multisig_config, open_ballot, verify_upgrade_quorum, GovernanceProposal,
+    GovernanceUpgradeProposal, GovernanceUpgradeProposedEvent, StagedUpgrade, VotingBallot,
+    GOVERNANCE_UPGRADE_KEY, MIN_LEDGER_DELAY,
 };
 use crate::slashing::{
     apply_escrow_penalty, get_fault_count_in_window, get_penalty_multiplier, record_tracking_fault,
@@ -114,8 +124,12 @@ use crate::slashing::{
 };
 use crate::staking_tiers::{
     assign_tier, effective_volume_score, required_stake_for_tier, validate_tier_config,
+    StakingTier, StakingTierConfig,
 };
+use crate::events::events::{emit_simple2, EV_UPGRADE_PROPOSED};
+use crate::errors::PROPOSAL_EXPIRY_SECONDS;
 use crate::storage::{NodeProfileKey, SignerKey, StakeKey, HeartbeatKey};
+pub use crate::staking_tiers::AssetFeedMetrics;
 use crate::validation::{
     check_bond_capacity, check_liquidity_depth, process_price_bundle, validate_telemetry_submission,
     AssetPriceUpdate, BundleValidationOutcome,
@@ -140,7 +154,7 @@ use crate::upgrades::migration::ensure_schema_version;
 /// The four canonical *external-API* error codes required by issue #720 are
 /// exposed as `const` aliases below the enum definition so they remain stable
 /// regardless of any future renumbering inside the enum body.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ContractError {
@@ -257,14 +271,13 @@ pub enum ContractError {
     /// Caller is not an authorized emergency signer.
     NotEmergencySigner = 87,
     /// Emergency override vote threshold not yet reached.
-    OverrideThresholdNotReached = 81,
+    OverrideThresholdNotReached = 89,
     /// Dynamic remittance fee split configuration is invalid.
-    InvalidFeeSplitConfig = 82,
+    InvalidFeeSplitConfig = 90,
     /// A fee allocation does not add up to the original total.
     FeeDistributionMismatch = 83,
-    /// The requested protocol fee exceeds the immutable 1.00% (`100` bps)
-    /// hard ceiling enforced by [`crate::fees::MAX_PROTOCOL_FEE_BPS`].
-    ProtocolFeeCapExceeded = 91,
+    /// Public inputs to zero-knowledge proof do not match contract state parameters.
+    InvalidZKPublicInputs = 84,
 }
 
 impl ContractError {
@@ -278,6 +291,26 @@ impl ContractError {
     pub const BridgeSupplyCapExceeded: Self = Self::Overflow;
     pub const BridgeInsufficientBalance: Self = Self::Overflow;
     pub const BridgeEscrowNotConfigured: Self = Self::NotInitialized;
+
+    // ── Bridge wrapped supply cap guard (Issue #1009) ─────────────────────
+    // Semantic aliases only, matching the `Bridge*` and `Harvest*` conventions
+    // above. No new `#[contracterror]` variants: that enum is already at 82
+    // cases against the soroban-sdk 20 cap of 50, so each new error is an alias
+    // rather than another variant.
+    /// A mint would push wrapped supply past the collateral-backed cap.
+    pub const BridgeCapExceeded: Self = Self::InsufficientReserveBalance;
+    /// Verified locked collateral is insufficient to cover the active wrapped
+    /// supply, or is smaller than a requested release.
+    pub const BridgeCapUndercollateralized: Self = Self::InsufficientReserveBalance;
+    /// A release or reconciliation asked for more than is recorded.
+    pub const BridgeCapInsufficientCollateral: Self = Self::InsufficientReserveBalance;
+    /// A locked-collateral figure was negative, which is not an observation.
+    pub const BridgeCapInvalidCollateral: Self = Self::InvalidArgument;
+    /// A configured capacity ratio fell outside its permitted bounds.
+    pub const BridgeCapInvalidConfig: Self = Self::InvalidVarianceConfig;
+    /// A supply delta, release amount or observed total was not strictly
+    /// positive, or reconciliation tried to lower the mirrored supply.
+    pub const BridgeCapInvalidAmount: Self = Self::AmountTooLow;
     pub const AdminChangeTimelockNotSatis: Self = Self::UpgradeTimelockNotSatisfied;
     pub const StagingNotAuthorized: Self = Self::Unauthorized;
     pub const EmptyRoute: Self = Self::AmountTooLow;
@@ -310,6 +343,28 @@ impl ContractError {
     pub const HarvestSlippageExceeded: Self = Self::SlippageExceeded;
     pub const HarvestInvalidPath: Self = Self::InconsistentRouteAssets;
 
+    // ── Auto-compounding yield drawdown guard (Issue #1010) ────────────────
+    // Semantic aliases only, matching the `Harvest*` convention above. No new
+    // `#[contracterror]` variants are introduced: that enum is already at 82
+    // cases against the soroban-sdk 20 cap of 50, so every new error here is
+    // expressed as an alias rather than widening the enum.
+    /// Auto-compounding harvest is paused because the reward token breached
+    /// its drawdown limit.
+    pub const YieldCompoundingPaused: Self = Self::ContractPaused;
+    /// A price observation or a 7-day reference price was not strictly
+    /// positive, so the price trend is undefined.
+    pub const YieldPriceNotPositive: Self = Self::InvalidArgument;
+    /// A price observation preceded the newest retained sample, which would
+    /// allow the reference price to be rewound.
+    pub const YieldStalePriceSample: Self = Self::StaleSequence;
+    /// A configured drawdown limit fell outside its permitted bounds.
+    pub const YieldInvalidDrawdownLimit: Self = Self::InvalidVarianceConfig;
+    /// A reserve-conversion route did not run reward token to base reserve, or
+    /// its length was out of bounds.
+    pub const YieldInvalidConversionPath: Self = Self::InconsistentRouteAssets;
+    /// The router delivered no base reserve at all.
+    pub const YieldConversionProducedNothing: Self = Self::AmountTooLow;
+
     // ── Issue #720 canonical API error aliases ────────────────────────────────
     // These four names are the stable external-facing identifiers documented in
     // the public ABI. Client SDKs SHOULD match against these variants by name.
@@ -328,14 +383,28 @@ pub(crate) const DATA_KEY: Symbol = symbol_short!("DATA");
 pub(crate) const SIGNERS_KEY: Symbol = symbol_short!("SIGNERS");
 pub(crate) const STAGING_KEY: Symbol = symbol_short!("STAGING");
 const PENDING_UPGRADE_KEY: Symbol = symbol_short!("PENDING");
+/// Storage key for the multi-stage timelock execution queue (Issue #996).
+const MULTI_STAGE_UPGRADE_KEY: Symbol = symbol_short!("MSTAGE");
 pub(crate) const UPGRADE_DELAY_SECONDS: u64 = 48 * 60 * 60;
 const STAKE_REGISTRY_KEY: Symbol = symbol_short!("STAKES");
 const TOTAL_STAKED_KEY: Symbol = symbol_short!("TOTAL");
 const HEARTBEAT_KEY: Symbol = symbol_short!("HBEAT");
 const HB_INTERVAL_KEY: Symbol = symbol_short!("HBINTV");
 pub(crate) const DEFAULT_HEARTBEAT_INTERVAL: u64 = 5 * 60;
-pub(crate) const SIGNERS_KEY: Symbol = symbol_short!("SIGNERS");
+pub(crate) const VALIDATOR_STATE_KEY: Symbol = symbol_short!("VSTATE");
+/// Instance map of proposal-topic -> lifecycle state for multi-sig approvals.
+pub(crate) const PROPOSAL_STATE_KEY: Symbol = symbol_short!("PROPST");
+/// Event/topic identifier for the emergency key-revocation proposal.
+pub(crate) const EMERGENCY_REVOCATION_TOPIC: Symbol = symbol_short!("EMREV");
 const REVOCATION_KEY: Symbol = symbol_short!("REVOKE");
+
+// Canonical numeric asset identifiers used by the built-in currency feeds.
+pub const ID_NGN: AssetId = 3897123275;
+pub const ID_KES: AssetId = 2654435761;
+pub const ID_GHS: AssetId = 4026531840;
+pub const ID_CFA: AssetId = 4160749568;
+pub const ID_ZAR: AssetId = 3219226362;
+pub const ID_UGX: AssetId = 2863311530;
 // Emergency key revocation / blocking
 pub(crate) const REVOKED_SIGNER_KEY: Symbol = symbol_short!("REVOKED");
 // EMERGENCY_REVOCATION_KEY is defined in admin.rs
@@ -353,7 +422,6 @@ pub const FEE_TIER_030_BPS: u32 = 30;
 pub const FEE_TIER_100_BPS: u32 = 100;
 pub const DEFAULT_FEE_TIER_BPS: u32 = FEE_TIER_030_BPS;
 const SEQUENCE_COUNTER_KEY: Symbol = symbol_short!("SEQCTR");
-const REVOCATION_KEY: Symbol = symbol_short!("REVOKE");
 const RECOVERY_KEY: Symbol = symbol_short!("RKEY");
 const LAST_ADMIN_ACTIVITY: Symbol = symbol_short!("LASTACT");
 
@@ -442,14 +510,10 @@ pub enum StakingStorageKey {
     FeedStake(Address, Symbol),
 }
 
-// Storage key newtype wrappers
-#[contracttype] pub struct HeartbeatKey(pub AssetId);
-#[contracttype] pub struct CorridorFeeKey(pub Symbol);
+// Storage key newtype wrappers are defined in `crate::storage`; the canonical
+// `HeartbeatKey`, `CorridorFeeKey`, and `AssetMetricsKey` types live there.
 
 // CorridorFeePool is imported/used from the fees module
-
-// AssetMetrics key wrapper
-#[contracttype] pub struct AssetMetricsKey(pub AssetId);
 
 /// Lifecycle states for a cross-border fiat settlement escrow.
 #[contracttype]
@@ -566,6 +630,72 @@ impl TimeLockedUpgradeContract {
         // #439: write treasury once at deployment; never overwritten
         env.storage().instance().set(&TREASURY_KEY, &treasury);
         Ok(())
+    }
+
+    /// Record a TWAP observation for `asset` at the current ledger timestamp.
+    ///
+    /// Observations feed the dynamic sample-window inspector (issue #1020).
+    pub fn record_twap_observation(
+        env: Env,
+        asset: Symbol,
+        price: i128,
+    ) -> Result<(), ContractError> {
+        if price <= 0 {
+            return Err(ContractError::InvalidArgument);
+        }
+        crate::twap_window::record_observation(&env, &asset, price, env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Inspect the dynamic TWAP sample window for `asset` without failing.
+    ///
+    /// Returns the active window, sample count, realized volatility, and the
+    /// windowed TWAP. Useful for off-chain monitoring and dashboards.
+    pub fn inspect_twap_window(
+        env: Env,
+        asset: Symbol,
+    ) -> Result<crate::twap_window::TwapWindowInspection, ContractError> {
+        Ok(crate::twap_window::inspect(
+            &env,
+            asset,
+            env.ledger().timestamp(),
+        ))
+    }
+
+    /// Return the windowed TWAP price for `asset`.
+    ///
+    /// Reverts with [`ContractError::InsufficientObservations`] when the active
+    /// observation window holds fewer than `Nmin = 10` samples.
+    pub fn get_twap_price(env: Env, asset: Symbol) -> Result<i128, ContractError> {
+        let inspection = crate::twap_window::enforce(&env, asset, env.ledger().timestamp())?;
+        Ok(inspection.twap)
+    }
+
+    /// Read the active TWAP window configuration for an asset.
+    pub fn get_twap_window_config(
+        env: Env,
+        asset: Symbol,
+    ) -> crate::twap_window::TwapWindowConfig {
+        crate::twap_window::get_config(&env, &asset)
+    }
+
+    /// Set the TWAP window configuration for an asset. Admin only.
+    pub fn set_twap_window_config(
+        env: Env,
+        admin: Address,
+        asset: Symbol,
+        config: crate::twap_window::TwapWindowConfig,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let data: ContractData = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY)
+            .ok_or(ContractError::NotInitialized)?;
+        if data.admin != admin {
+            return Err(ContractError::NotAdmin);
+        }
+        crate::twap_window::set_config(&env, &asset, &config)
     }
 
     pub fn stake_and_register(env: Env, node: Address, amount: u64) -> Result<StakeRecord, ContractError> {
@@ -764,6 +894,9 @@ impl TimeLockedUpgradeContract {
         let data = Self::get_data(env.clone())?;
         if data.admin != proposer { return Err(ContractError::NotAdmin); }
         proposer.require_auth();
+        if veto::is_hash_vetoed(&env, &new_wasm_hash) {
+            return Err(ContractError::ProposalAlreadyVetoed);
+        }
         consume_nonce(&env, &proposer, nonce, salt, salt_signature)?;
 
         // Verify multi-sig quorum threshold
@@ -817,10 +950,13 @@ impl TimeLockedUpgradeContract {
         executor.require_auth();
         consume_nonce(&env, &executor, nonce, salt, signature)?;
         let pending: StagedUpgrade = env.storage().instance().get(&PENDING_UPGRADE_KEY).ok_or(ContractError::NoPendingUpgrade)?;
+        if veto::is_hash_vetoed(&env, &pending.new_wasm_hash) {
+            return Err(ContractError::ProposalAlreadyVetoed);
+        }
         if !verify_staged_delay(pending.staged_at, env.ledger().sequence()) {
             return Err(ContractError::UpgradeTimelockNotSatisfied);
         }
-        env.deployer().update_current_contract_wasm(pending.wasm_hash.to_array());
+        env.deployer().update_current_contract_wasm(pending.new_wasm_hash.to_array());
         env.storage().instance().remove(&PENDING_UPGRADE_KEY);
         Self::_remove_proposal_state(&env, GOVERNANCE_UPGRADE_KEY);
         crate::instance::bump_instance_ttl(&env);
@@ -882,6 +1018,116 @@ impl TimeLockedUpgradeContract {
         Self::_extend_instance_ttl(&env);
         crate::instance::bump_instance_ttl(&env);
         Ok(())
+    }
+
+    // --- Multi-stage timelock execution queue (Issue #996) ---
+
+    /// Stage 1: publicly announce the intent to perform a major upgrade.
+    ///
+    /// Starts a 24-hour notification delay before the payload may be approved.
+    pub fn notify_upgrade_intent(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+        proposer: Address,
+    ) -> Result<(), ContractError> {
+        let data = Self::get_data(env.clone())?;
+        if data.admin != proposer { return Err(ContractError::NotAdmin); }
+        proposer.require_auth();
+
+        let entry = crate::upgrades::multi_stage::notify_intent(
+            new_wasm_hash,
+            proposer,
+            env.ledger().timestamp(),
+        );
+        env.storage().instance().set(&MULTI_STAGE_UPGRADE_KEY, &entry);
+        crate::instance::bump_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Stage 2: verify the code payload and record the approval vote.
+    ///
+    /// Only valid once the 24-hour Stage 1 notification delay has elapsed.
+    /// Opens the Stage 3 execution window 48 hours from now.
+    pub fn approve_upgrade_payload(
+        env: Env,
+        approver: Address,
+    ) -> Result<(), ContractError> {
+        let data = Self::get_data(env.clone())?;
+        if data.admin != approver { return Err(ContractError::NotAdmin); }
+        approver.require_auth();
+
+        let entry: crate::upgrades::multi_stage::MultiStageUpgrade = env
+            .storage()
+            .instance()
+            .get(&MULTI_STAGE_UPGRADE_KEY)
+            .ok_or(ContractError::NoPendingUpgrade)?;
+
+        let approved = crate::upgrades::multi_stage::approve_payload(
+            &entry,
+            env.ledger().timestamp(),
+        )
+        .ok_or(ContractError::UpgradeTimelockNotSatisfied)?;
+
+        env.storage().instance().set(&MULTI_STAGE_UPGRADE_KEY, &approved);
+        crate::instance::bump_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Stage 3: execute the queued upgrade inside the 24-hour execution window.
+    pub fn execute_queued_upgrade(
+        env: Env,
+        executor: Address,
+    ) -> Result<(), ContractError> {
+        let data = Self::get_data(env.clone())?;
+        if data.admin != executor { return Err(ContractError::NotAdmin); }
+        executor.require_auth();
+
+        let entry: crate::upgrades::multi_stage::MultiStageUpgrade = env
+            .storage()
+            .instance()
+            .get(&MULTI_STAGE_UPGRADE_KEY)
+            .ok_or(ContractError::NoPendingUpgrade)?;
+
+        let executed = crate::upgrades::multi_stage::execute(
+            &entry,
+            env.ledger().timestamp(),
+        )
+        .ok_or(ContractError::UpgradeTimelockNotSatisfied)?;
+
+        env.deployer().update_current_contract_wasm(executed.new_wasm_hash.to_array());
+        env.storage().instance().set(&MULTI_STAGE_UPGRADE_KEY, &executed);
+        crate::instance::bump_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Return the current multi-stage queue entry, if any.
+    pub fn get_multi_stage_upgrade(
+        env: Env,
+    ) -> Option<crate::upgrades::multi_stage::MultiStageUpgrade> {
+        env.storage().instance().get(&MULTI_STAGE_UPGRADE_KEY)
+    }
+
+    /// Return the number of seconds remaining before the queue entry can
+    /// advance to its next stage, or `None` if there is no active entry.
+    pub fn get_multi_stage_remaining(env: Env) -> Option<u64> {
+        use crate::upgrades::multi_stage::{
+            MultiStageUpgrade, TimelockStage, STAGE1_INTENT_DELAY_SECONDS,
+        };
+
+        let entry: MultiStageUpgrade = env.storage().instance().get(&MULTI_STAGE_UPGRADE_KEY)?;
+        let now = env.ledger().timestamp();
+        match entry.stage {
+            TimelockStage::IntentNotified => Some(
+                STAGE1_INTENT_DELAY_SECONDS.saturating_sub(now.saturating_sub(entry.intent_at)),
+            ),
+            TimelockStage::PayloadApproved => {
+                Some(entry.window_opens_at.saturating_sub(now))
+            }
+            TimelockStage::ExecutionWindowOpen => {
+                Some(entry.window_closes_at.saturating_sub(now))
+            }
+            TimelockStage::Executed | TimelockStage::Expired => Some(0),
+        }
     }
 
     pub fn set_current_wasm(env: Env, admin: Address, wasm_hash: BytesN<32>) -> Result<(), ContractError> {
@@ -1081,6 +1327,137 @@ impl TimeLockedUpgradeContract {
         settlement::fees::get_position(&env, asset, provider)
     }
 
+    // ── Cross-Border Fiat-Anchor Collateral Ratio Monitor (Issue #991) ──
+    //
+    // Tracks R_anchor = Collateral_locked / Volume_unsettled per
+    // (anchor, corridor) and pauses new remittance assignments to an anchor
+    // whose ratio drops below the corridor minimum (default 120 %). Routing
+    // resumes as soon as the anchor deposits enough additional collateral.
+
+    /// Post additional token collateral for a fiat anchor on a corridor.
+    ///
+    /// Doubles as the recovery path from a pause: once the backing ratio
+    /// reaches the corridor minimum the pause is cleared in the same call.
+    pub fn deposit_anchor_collateral(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::deposit_collateral(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Release uncommitted collateral back to an anchor.
+    ///
+    /// Rejected when the withdrawal would drop the backing ratio below the
+    /// corridor minimum, which includes every withdrawal while the anchor is
+    /// paused.
+    pub fn withdraw_anchor_collateral(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::withdraw_collateral(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Assign a new fiat payout to an anchor, appending it to the active
+    /// payout queue.
+    ///
+    /// Fails with [`ContractError::AnchorAssignmentsPaused`] when routing to
+    /// the anchor is already paused, and with
+    /// [`ContractError::AnchorUndercollateralized`] when admitting the payout
+    /// would push the backing ratio below the corridor minimum. The queue is
+    /// left untouched on either rejection path.
+    pub fn assign_anchor_fiat_payout(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::FiatPayoutEntry, ContractError> {
+        settlement::anchor_collateral::assign_fiat_payout(&env, &caller, &anchor, corridor, amount)
+    }
+
+    /// Mark a queued fiat payout as settled off-ledger, consuming the token
+    /// collateral that backed it.
+    pub fn settle_anchor_fiat_payout(
+        env: Env,
+        caller: Address,
+        anchor: Address,
+        corridor: AssetId,
+        payout_id: u64,
+        amount: u128,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralState, ContractError> {
+        settlement::anchor_collateral::settle_fiat_payout(
+            &env, &caller, &anchor, corridor, payout_id, amount,
+        )
+    }
+
+    /// Permissionless monitoring tick: re-evaluate an anchor's backing ratio
+    /// and latch or clear its pause flag.
+    pub fn sync_anchor_collateral_ratio(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> Result<settlement::anchor_collateral::AnchorCollateralStatus, ContractError> {
+        settlement::anchor_collateral::sync_anchor_ratio(&env, &anchor, corridor)
+    }
+
+    /// Read the monitoring snapshot for an anchor on a corridor.
+    pub fn get_anchor_collateral_status(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> settlement::anchor_collateral::AnchorCollateralStatus {
+        settlement::anchor_collateral::get_anchor_status(&env, &anchor, corridor)
+    }
+
+    /// Read the active, unsettled fiat payout queue for an anchor.
+    pub fn get_anchor_payout_queue(
+        env: Env,
+        anchor: Address,
+        corridor: AssetId,
+    ) -> Vec<settlement::anchor_collateral::FiatPayoutEntry> {
+        settlement::anchor_collateral::read_payout_queue(&env, &anchor, corridor)
+    }
+
+    /// Governance-configurable minimum backing ratio for a corridor, in basis
+    /// points. Defaults to 120 % and cannot be set below 100 %.
+    pub fn set_anchor_min_collateral_ratio(
+        env: Env,
+        admin: Address,
+        corridor: AssetId,
+        min_ratio_bps: u32,
+    ) -> Result<u32, ContractError> {
+        settlement::anchor_collateral::set_min_collateral_ratio_bps(
+            &env, &admin, corridor, min_ratio_bps,
+        )
+    }
+
+    /// Compute the anchor backing ratio `Collateral_locked / Volume_unsettled`
+    /// in basis points. Saturates at [`u32::MAX`] and returns `0` for an
+    /// empty payout queue, where the ratio is unbounded.
+    pub fn anchor_backing_ratio_bps(collateral_locked: u128, volume_unsettled: u128) -> u32 {
+        settlement::anchor_collateral::backing_ratio_bps(collateral_locked, volume_unsettled)
+    }
+
+    /// `true` when `collateral_locked` backs `volume_unsettled` at
+    /// `min_ratio_bps`. An empty payout queue is always sufficient.
+    pub fn is_anchor_collateral_sufficient(
+        collateral_locked: u128,
+        volume_unsettled: u128,
+        min_ratio_bps: u32,
+    ) -> bool {
+        settlement::anchor_collateral::is_collateral_sufficient(
+            collateral_locked,
+            volume_unsettled,
+            min_ratio_bps,
+        )
+    }
+
     /// Record flash loan fee revenue for an asset.
     pub fn record_flash_fee(
         env: Env,
@@ -1111,6 +1488,30 @@ impl TimeLockedUpgradeContract {
         asset: AssetId,
     ) -> Result<(u64, u64), ContractError> {
         fees::distribute_flash_fees(&env, &caller, asset)
+    }
+
+    // ── Flash Loan Arbitrage Fee Multiplier Engine (Issue #902) ────────────
+
+    /// Compute the dynamic flash-loan protocol fee scalar:
+    /// `f_fee = f_base + (L_borrowed / L_pool) × f_premium`.
+    pub fn quote_flash_loan_fee(
+        base_bps: u32,
+        premium_bps: u32,
+        borrowed: i128,
+        pool: i128,
+    ) -> Result<flash_fee_engine::FlashLoanFeeQuote, ContractError> {
+        flash_fee_engine::compute_flash_loan_fee(base_bps, premium_bps, borrowed, pool)
+    }
+
+    /// Verify that a flash-loan repayment clears the dynamic fee threshold:
+    /// `B_return >= B_borrowed × (1 + f_fee)`. Reverts with
+    /// [`ContractError::InsufficientFlashLoanRepayment`] when it does not.
+    pub fn verify_flash_loan_repayment(
+        borrowed: i128,
+        returned: i128,
+        fee_bps: u32,
+    ) -> Result<(), ContractError> {
+        flash_fee_engine::assert_flash_repayment(borrowed, returned, fee_bps)
     }
 
     /// Get the current dynamic trading fee for an asset (in basis points)
@@ -1429,6 +1830,22 @@ impl TimeLockedUpgradeContract {
         storage::preflight_rent_check(&env);
     }
 
+    // ── Instance storage rent-expiry monitor (Issue #953) ────────────────
+
+    /// Returns the remaining ledger lifetime of the watched instance-storage
+    /// key `key`, emitting a `ttl_warn` event when fewer than 10,000 ledgers
+    /// remain. Keys that were never refreshed report `0`.
+    pub fn check_key_ttl(env: Env, key: Symbol) -> u32 {
+        storage::check_key_ttl(&env, key)
+    }
+
+    /// (Re)starts the watch on the instance-storage key `key`, extending the
+    /// contract instance TTL and recording the current ledger. Returns the
+    /// refreshed remaining lifetime.
+    pub fn refresh_key_ttl(env: Env, key: Symbol) -> u32 {
+        storage::refresh_key_ttl(&env, key)
+    }
+
     // ── Governance Proposal Execution Timelock Cancellation (Issue #796) ──
 
     /// Submit a governance proposal for contract upgrade with timelock.
@@ -1490,6 +1907,37 @@ impl TimeLockedUpgradeContract {
         proposal_id: u64,
     ) -> bool {
         governance::is_proposal_executable(&env, proposal_id)
+    }
+
+    // ── Multi-Sig Proposal Cancellation by Emergency Guardian (Issue #927) ──
+
+    /// Return the currently designated emergency guardian, if any.
+    pub fn get_emergency_guardian(env: Env) -> Option<Address> {
+        governance::get_emergency_guardian(&env)
+    }
+
+    /// Designate (or rotate) the emergency guardian address (admin only).
+    ///
+    /// The guardian may unilaterally nullify active administrative proposals
+    /// without waiting for a multi-sig quorum.
+    pub fn designate_emergency_guardian(
+        env: Env,
+        admin: Address,
+        guardian: Address,
+    ) -> Result<(), ContractError> {
+        governance::designate_emergency_guardian(&env, admin, guardian)
+    }
+
+    /// Emergency-guardian nullification of an active governance proposal.
+    ///
+    /// Nullifies the pending proposal and permanently removes its unexecuted
+    /// `wasm_hash` from persistent state before the timelock expires.
+    pub fn emergency_cancel_governance_proposal(
+        env: Env,
+        guardian: Address,
+        proposal_id: u64,
+    ) -> Result<(), ContractError> {
+        governance::emergency_cancel_proposal(&env, guardian, proposal_id)
     }
 
     // ── Emergency Key Revocation (multi-sig coordinator group) ───────────────
@@ -1604,19 +2052,19 @@ impl TimeLockedUpgradeContract {
         veto::get_security_council(&env)
     }
 
-    /// Veto an active proposal, instantly transitioning it to `Vetoed` state.
+    /// Veto a queued governance proposal during its timelock.
     ///
     /// Only the designated Security Council may invoke this function. Upon veto:
-    /// 1. The proposal is marked as vetoed
+    /// 1. The queued proposal is removed and its hash is rejected on re-submission
     /// 2. Execution payload is invalidated
-    /// 3. Audit trail is recorded with reason hash
+    /// 3. Audit trail is recorded with the reason string
     /// 4. `ProposalVetoed` event is emitted
     ///
     /// # Arguments
     /// * `env` - The contract environment
     /// * `caller` - The address attempting the veto (must be Security Council)
     /// * `proposal_id` - The ID of the proposal to veto
-    /// * `reason` - Audit reason string (logged as hash for transparency)
+    /// * `reason` - Audit reason string
     ///
     /// # Errors
     /// - [`ContractError::NotSecurityCouncil`] if the caller is not the Security Council
@@ -1939,6 +2387,36 @@ impl TimeLockedUpgradeContract {
         )
     }
 
+    /// Atomically liquidate a distressed vault position using a flash loan.
+    ///
+    /// This entrypoint implements the full atomic liquidation sequence for
+    /// issue #1023:
+    ///
+    /// 1. **Validate** — confirm the vault is below the liquidation threshold.
+    /// 2. **Borrow** — record flash loan obligation (principal + fee).
+    /// 3. **Repay vault debt** — seize proportional collateral plus the 5%
+    ///    liquidator bonus from the distressed vault.
+    /// 4. **Swap collateral** — exchange seized collateral back to the debt
+    ///    asset via the AMM/DEX router specified in `params`.
+    /// 5. **Repay flash loan** — settle principal + fee with the lender within
+    ///    the same transaction frame.
+    /// 6. **Health check** — verify the vault's post-liquidation health factor
+    ///    is above `params.min_health_factor_bps` (defaults to 110%).
+    ///
+    /// Returns [`ContractError::FlashLiquidationHealthCheckFailed`] if the
+    /// vault is healthy or fails to recover after liquidation, and
+    /// [`ContractError::FlashLiquidationInsufficientRepay`] if collateral
+    /// proceeds do not cover the flash loan principal + fee.
+    ///
+    /// Closes #1023.
+    pub fn flash_loan_liquidate(
+        env: Env,
+        position: vaults::liquidation::VaultPosition,
+        params: vaults::liquidation::FlashLoanLiquidationParams,
+    ) -> Result<vaults::liquidation::FlashLoanLiquidationResult, ContractError> {
+        vaults::liquidation::flash_loan_liquidate(&env, &position, &params)
+    }
+
     pub fn vault_config(env: Env) -> Option<vaults::autocompound::VaultConfig> {
         vaults::autocompound::get_config(&env)
     }
@@ -1996,6 +2474,141 @@ impl TimeLockedUpgradeContract {
     ) -> Result<vaults::harvest_compound::HarvestCompoundResult, ContractError> {
         let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
         vaults::harvest_compound::harvest_and_compound(&env, user, router, path, min_lp_out)
+    }
+
+    // ── Auto-compounding yield drawdown guard (Issue #1010) ─────────────────
+    //
+    // Tracks ΔP = (P_current - P_7d) / P_7d for each vault's target reward
+    // token and pauses auto-compounding harvest past the corridor drawdown
+    // limit (default 20 %), directing the strategy to convert accrued rewards
+    // into the base stablecoin reserve instead of re-investing them.
+
+    /// Configure a vault's drawdown guard.
+    pub fn configure_compounding_guard(
+        env: Env,
+        admin: Address,
+        vault: AssetId,
+        reward_token: Address,
+        base_reserve: Address,
+        max_drawdown_bps: i64,
+        window_secs: u64,
+    ) -> Result<vaults::compounding_guard::CompoundingGuardConfig, ContractError> {
+        vaults::compounding_guard::configure_guard(
+            &env,
+            &admin,
+            vault,
+            reward_token,
+            base_reserve,
+            max_drawdown_bps,
+            window_secs,
+        )
+    }
+
+    /// Update only the drawdown limit of an existing guard.
+    pub fn set_yield_max_drawdown_bps(
+        env: Env,
+        admin: Address,
+        vault: AssetId,
+        max_drawdown_bps: i64,
+    ) -> Result<vaults::compounding_guard::CompoundingGuardConfig, ContractError> {
+        vaults::compounding_guard::set_max_drawdown_bps(&env, &admin, vault, max_drawdown_bps)
+    }
+
+    /// Record a reward-token price observation and re-evaluate the guard.
+    pub fn record_yield_price_sample(
+        env: Env,
+        keeper: Address,
+        vault: AssetId,
+        price: i128,
+    ) -> Result<vaults::compounding_guard::DrawdownStatus, ContractError> {
+        vaults::compounding_guard::record_price_sample(&env, &keeper, vault, price)
+    }
+
+    /// Permissionless monitoring tick: re-evaluate the trend and latch or clear
+    /// the auto-compounding pause.
+    pub fn sync_yield_drawdown(
+        env: Env,
+        vault: AssetId,
+    ) -> Result<vaults::compounding_guard::DrawdownStatus, ContractError> {
+        vaults::compounding_guard::sync_drawdown(&env, vault)
+    }
+
+    /// Read the drawdown monitoring snapshot for a vault.
+    pub fn get_yield_drawdown_status(
+        env: Env,
+        vault: AssetId,
+    ) -> Result<vaults::compounding_guard::DrawdownStatus, ContractError> {
+        vaults::compounding_guard::drawdown_status(&env, vault)
+    }
+
+    /// `true` when auto-compounding harvest is paused for a vault.
+    pub fn is_yield_compounding_paused(env: Env, vault: AssetId) -> bool {
+        vaults::compounding_guard::is_auto_compounding_paused(&env, vault)
+    }
+
+    /// What the auto-compounding strategy should do with accrued rewards:
+    /// re-invest, convert to base reserves, or hold.
+    pub fn yield_compounding_action(
+        env: Env,
+        vault: AssetId,
+    ) -> vaults::compounding_guard::CompoundingAction {
+        vaults::compounding_guard::strategy_action(&env, vault)
+    }
+
+    /// Convert accrued rewards into the base stablecoin reserve instead of
+    /// re-investing them. Callable while the guard is tripped, which is exactly
+    /// when it is needed.
+    pub fn convert_yield_to_reserves(
+        env: Env,
+        keeper: Address,
+        router: Address,
+        vault: AssetId,
+        path: Vec<Address>,
+        reward_amount: i128,
+        min_reserve_out: i128,
+    ) -> Result<vaults::compounding_guard::ReserveConversion, ContractError> {
+        let _guard = security::reentrancy::ReentrancyGuard::new(&env)?;
+        vaults::compounding_guard::convert_rewards_to_reserves(
+            &env,
+            &keeper,
+            router,
+            vault,
+            path,
+            reward_amount,
+            min_reserve_out,
+        )
+    }
+
+    /// Read the base-reserve balance booked through conversions.
+    pub fn yield_reserve_accrued(env: Env, vault: AssetId) -> i128 {
+        vaults::compounding_guard::reserve_accrued(&env, vault)
+    }
+
+    /// Sweep booked base reserves out of the vault.
+    pub fn sweep_yield_reserves(
+        env: Env,
+        admin: Address,
+        to: Address,
+        vault: AssetId,
+        amount: i128,
+    ) -> Result<i128, ContractError> {
+        vaults::compounding_guard::sweep_reserves(&env, &admin, to, vault, amount)
+    }
+
+    /// Compute the signed price trend `(P_current - P_7d) / P_7d` in basis
+    /// points. Positive means appreciation.
+    pub fn yield_price_trend_bps(current: i128, reference: i128) -> Result<i64, ContractError> {
+        vaults::compounding_guard::price_trend_bps(current, reference)
+    }
+
+    /// `true` when the reward token has depreciated by strictly more than
+    /// `max_drawdown_bps` between `reference` and `current`.
+    pub fn is_yield_drawdown_exceeded(
+        current: i128,
+        reference: i128,
+        max_drawdown_bps: i64,
+    ) -> bool {
+        vaults::compounding_guard::is_drawdown_exceeded(current, reference, max_drawdown_bps)
     }
 
     // ── On-chain limit order book (Issue #701) ───────────────────────────────
@@ -2418,6 +3031,28 @@ impl TimeLockedUpgradeContract {
         pubkey: BytesN<32>,
     ) -> Result<(), ContractError> {
         bridge::relayer::remove_validator(&env, &admin, pubkey)
+    }
+
+    /// Stake collateral deposit for an active bridge validator (Issue #959).
+    pub fn stake_bridge_validator(
+        env: Env,
+        validator: BytesN<32>,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        bridge::slashing::stake_validator_collateral(&env, &validator, amount)
+    }
+
+    /// Get current staked collateral deposit for a bridge validator (Issue #959).
+    pub fn get_bridge_validator_collateral(env: Env, validator: BytesN<32>) -> i128 {
+        bridge::slashing::get_validator_collateral(&env, &validator)
+    }
+
+    /// Submit cryptographic double-sign proof to slash offending validator 100% and ban permanently (Issue #959).
+    pub fn submit_double_sign_proof(
+        env: Env,
+        proof: bridge::slashing::DoubleSignProof,
+    ) -> Result<i128, ContractError> {
+        bridge::slashing::process_double_sign_proof(&env, &proof)
     }
 
     // --- Native bridge escrow (Issue #750) ---
@@ -3072,6 +3707,77 @@ impl TimeLockedUpgradeContract {
         )>,
     ) -> Result<Vec<zk::verifier::VerificationResult>, ContractError> {
         zk::verifier::batch_verify_proofs(&env, &proofs)
+    }
+
+    // ── Timelocked ZK Verification Key Rotation (Issue #931) ──────────────
+
+    /// Queue a governance-timelocked rotation of a circuit's ZK verification
+    /// key. The new verification key and its proving key are validated
+    /// structurally before the proposal is persisted. Returns the version
+    /// identifier assigned to the queued update.
+    pub fn queue_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        vkey: zk::verifier::VerificationKey,
+        proving_key: zk::proving_key::UploadedProvingKey,
+        schema: zk::proving_key::ProvingKeySchema,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        let update = zk::key_update::queue_verification_key_update(
+            &env,
+            caller,
+            vkey,
+            proving_key,
+            schema,
+        )?;
+        Ok(update.version)
+    }
+
+    /// Execute a queued ZK verification-key rotation once its governance
+    /// timelock has elapsed. Re-validates structural integrity, commits the
+    /// key, and emits `ZKVerificationKeysUpdated` with the version identifier.
+    pub fn execute_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<u32, ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::execute_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Cancel a pending (queued but unexecuted) ZK verification-key rotation.
+    pub fn cancel_zk_verification_key_update(
+        env: Env,
+        caller: Address,
+        circuit_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        let data = Self::_load_data(&env)?;
+        if data.admin != caller {
+            return Err(ContractError::NotAdmin);
+        }
+        caller.require_auth();
+        zk::key_update::cancel_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the pending ZK verification-key rotation for a circuit, if any.
+    pub fn get_pending_zk_verification_key_update(
+        env: Env,
+        circuit_id: BytesN<32>,
+    ) -> Option<zk::key_update::ZKVerificationKeyUpdate> {
+        zk::key_update::get_pending_verification_key_update(&env, &circuit_id)
+    }
+
+    /// Read the latest committed ZK verification-key version for a circuit.
+    pub fn get_zk_verification_key_version(env: Env, circuit_id: BytesN<32>) -> u32 {
+        zk::key_update::get_verification_key_version(&env, &circuit_id)
     }
 
 #[cfg(test)]
