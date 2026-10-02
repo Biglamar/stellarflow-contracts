@@ -215,9 +215,37 @@ pub fn publish_swap(
     );
 }
 
-/// Returns the canonical module identifier used as the first event topic.
-/// Exposed for tests and indexer integration tooling.
-pub fn module_identifier(env: &Env) -> Symbol {
-    let _ = env;
-    MODULE
+/// Publish when the single-ledger price-impact guard trips (issue #970).
+///
+/// Emitted from `twap::record_and_evaluate` on the price write whose instant
+/// price left the 5% band around the 5-ledger moving average `P_ma`, so
+/// indexers and vault operators can see exactly when borrowing was paused.
+pub fn publish_price_impact_guard_triggered(
+    env: &Env,
+    asset: Symbol,
+    instant_price: i128,
+    moving_average: i128,
+    deviation_bps: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "price_impact_guard_triggered"), asset),
+        (instant_price, moving_average, deviation_bps),
+    );
+}
+
+/// Publish when the single-ledger price-impact guard clears (issue #970).
+///
+/// Emitted once the instant price is back inside the 5% band, signalling that
+/// borrow entrypoints may resume.
+pub fn publish_price_impact_guard_cleared(
+    env: &Env,
+    asset: Symbol,
+    instant_price: i128,
+    moving_average: i128,
+    deviation_bps: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "price_impact_guard_cleared"), asset),
+        (instant_price, moving_average, deviation_bps),
+    );
 }
