@@ -49,8 +49,10 @@ pub enum ContractError {
     /// The nullifier has already been recorded — this note was already withdrawn.
     NullifierAlreadySpent = 1,
     /// The supplied ZK proof did not verify against the nullifier/public inputs.
+    /// Recovery steps: Inspect the state for InvalidProof and retry with valid inputs or proper conditions.
     InvalidProof = 2,
     /// The supplied sparse Merkle path does not prove the nullifier is unspent.
+    /// Recovery steps: Inspect the state for InvalidMerkleProof and retry with valid inputs or proper conditions.
     InvalidMerkleProof = 3,
 }
 
