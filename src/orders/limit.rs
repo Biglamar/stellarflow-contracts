@@ -812,6 +812,47 @@ pub fn get_order(env: &Env, order_id: u64) -> Option<LimitOrder> {
     load_order(env, order_id).ok()
 }
 
+/// Purge storage entries for a list of closed (fully executed or cancelled) limit orders.
+/// Clears the `Order(pair, price_tick, order_id)`, `OrderIndex(order_id)`, and legacy `Order(order_id)` keys.
+/// Returns the number of order records successfully purged.
+pub fn purge_closed_orders(env: &Env, order_ids: &Vec<u64>) -> u32 {
+    let mut purged = 0u32;
+    for order_id in order_ids.iter() {
+        let mut was_purged = false;
+        if let Some(index) = env
+            .storage()
+            .persistent()
+            .get::<_, (AssetPair, i128)>(&OrderStorageKey::OrderIndex(order_id))
+        {
+            let key = OrderStorageKey::Order(index.0.clone(), index.1, order_id);
+            if let Some(order) = env.storage().persistent().get::<_, LimitOrder>(&key) {
+                if !order.active || order.remaining_amount == 0 {
+                    bucket_remove(env, &index.0, index.1, order_id);
+                    env.storage().persistent().remove(&key);
+                    env.storage().persistent().remove(&OrderStorageKey::OrderIndex(order_id));
+                    was_purged = true;
+                }
+            } else {
+                env.storage().persistent().remove(&OrderStorageKey::OrderIndex(order_id));
+                was_purged = true;
+            }
+        }
+
+        let legacy_key = OrderStorageKey::Order(order_id);
+        if let Some(order) = env.storage().persistent().get::<_, LimitOrder>(&legacy_key) {
+            if !order.active || order.remaining_amount == 0 {
+                env.storage().persistent().remove(&legacy_key);
+                was_purged = true;
+            }
+        }
+
+        if was_purged {
+            purged += 1;
+        }
+    }
+    purged
+}
+
 /// List the ids of every order currently resting at `(pair, price_tick)`.
 pub fn get_orders_at_tick(env: &Env, pair: AssetPair, price_tick: i128) -> Vec<u64> {
     env.storage()

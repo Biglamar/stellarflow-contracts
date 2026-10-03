@@ -3758,6 +3758,26 @@ impl TimeLockedUpgradeContract {
         admin::cleanup::cleanup_zero_balances(&env, &signers, &targets)
     }
 
+    // ── Issue #919: Automated Storage Space Reclamation Helper ─────────────
+
+    /// Purge persistent storage entries for closed (fully executed or cancelled) limit orders,
+    /// reclaiming storage footprint and returning reclaimed storage count directly to caller.
+    pub fn reclaim_closed_orders(
+        env: Env,
+        caller: Address,
+        order_ids: Vec<u64>,
+    ) -> Result<u32, ContractError> {
+        admin::cleanup::reclaim_closed_orders_storage(&env, &caller, &order_ids)
+    }
+
+    /// Purge expired proposals from temporary and persistent storage to reclaim storage footprint.
+    pub fn reclaim_expired_proposals(
+        env: Env,
+        caller: Address,
+    ) -> Result<u32, ContractError> {
+        admin::cleanup::reclaim_expired_proposals_storage(&env, &caller)
+    }
+
     // ── Issue #782: Key Pruning Utility for Obsolete Contract Data ──────────
 
     /// Clean up obsolete contract storage keys (spent orders, closed escrows,
