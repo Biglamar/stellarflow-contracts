@@ -21,13 +21,21 @@
 //! emit_event(env, EventName::PriceUpdate, &[&asset_sym], &(price, timestamp));
 //! ```
 
-use soroban_sdk::{symbol_short, Env, Symbol, Vec};
+use alloc::format;
+use soroban_sdk::{contracttype, symbol_short, Env, Symbol, Vec};
 
 use crate::ContractError;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/// Flash-loan fee distribution event topic.
+pub const EV_FLASH_FEES_DISTRIBUTED: Symbol = symbol_short!("flashfee");
+/// Governance proposal creation event topic.
+pub const EV_PROPOSAL_CREATED: Symbol = symbol_short!("propcrea");
+/// Adaptive-fee change event topic.
+pub const EV_ADAPTIVE_FEE: Symbol = symbol_short!("afee");
 
 /// Maximum number of indexed Symbol topics allowed per event.
 /// RPC `getEvents` queries filter on topic vectors; keeping this bounded
@@ -155,11 +163,24 @@ pub const EV_REMITTANCE_FEE_SPLIT_CALCULATED: Symbol = symbol_short!("rem_split"
 /// Protocol: adaptive fee was clamped to the hardcoded safety floor.
 pub const EV_PROTOCOL_FEE_FLOOR_ENFORCED: Symbol = symbol_short!("fee_floor");
 
+/// Protocol: a fee-adjustment transaction changed the protocol fee ceiling or
+/// the active protocol fee tier. Emitted with the asset symbol as the second
+/// topic and a `ProtocolFeeChanged` payload recording the old and new fee.
+pub const EV_PROTOCOL_FEE_CHANGED: Symbol = symbol_short!("fee_chg");
+
 /// Treasury: reserve concentration exceeded the diversification threshold and a swap plan was generated.
 pub const EV_TREASURY_DIVERSIFICATION_TRIGGERED: Symbol = symbol_short!("treas_div");
 
 /// Governance: a proposal was vetoed by the Security Council.
-pub const EV_PROPOSAL_VETOED: Symbol = symbol_short!("prop_vet");
+
+/// Flash loans: fees were distributed to the reward pools.
+pub const EV_FLASH_FEES_DISTRIBUTED: Symbol = symbol_short!("flashfee");
+
+/// Governance: a new proposal was created.
+pub const EV_PROPOSAL_CREATED: Symbol = symbol_short!("prop_new");
+
+/// AMM: the adaptive fee controller adjusted a pool's fee.
+pub const EV_ADAPTIVE_FEE: Symbol = symbol_short!("adap_fee");
 
 /// Orders: a trader committed to a hidden trade (commit-reveal, Issue #761).
 pub const EV_COMMIT_NEW: Symbol = symbol_short!("cmt_new");
@@ -172,6 +193,9 @@ pub const EV_COMMIT_FORFEIT: Symbol = symbol_short!("cmt_frf");
 
 /// ZK: a batch of deposit note commitments was inserted into the Merkle tree.
 pub const EV_ZK_BATCH_COMMIT: Symbol = symbol_short!("zk_batch");
+
+/// Vault: position nearing insolvent threshold was automatically deleveraged.
+pub const EV_VAULT_DELEVERAGED: Symbol = symbol_short!("vlt_delev");
 
 // ---------------------------------------------------------------------------
 // Cross-border fiat escrow settlement lifecycle
@@ -264,6 +288,34 @@ pub fn validate_topics(topic_count: u32) -> Result<(), ContractError> {
     }
 }
 
+/// Publish a standardized event with a compressed payload (Issue #1019).
+///
+/// Numeric state values are varint-encoded into a compact byte array and
+/// status flags / sequence / timestamp are bit-packed into a single 64-bit
+/// word, minimizing ledger event storage fees. Off-chain tools decode the
+/// payload with `compression::decode_varint` and `compression::unpack_word`.
+///
+/// # Arguments
+/// * `env` - Soroban environment.
+/// * `event_name` - The primary event topic (determines RPC filter key).
+/// * `extra_topics` - Additional indexed topics (up to 3 more).
+/// * `numeric_fields` - Numeric state values, in declaration order.
+/// * `packed_word` - Flags/sequence/timestamp word from `compression::pack_word`.
+///
+/// # Errors
+/// Returns [`ContractError::EventTopicLimitExceeded`] if the total topic
+/// count exceeds [`MAX_EVENT_TOPICS`].
+pub fn emit_compressed_event(
+    env: &Env,
+    event_name: Symbol,
+    extra_topics: &[&Symbol],
+    numeric_fields: &[u64],
+    packed_word: u64,
+) -> Result<(), ContractError> {
+    let payload = super::compression::CompressedEventPayload::new(env, numeric_fields, packed_word);
+    emit_event(env, event_name, extra_topics, payload)
+}
+
 /// Event payload emitted when flash loan service fees are distributed.
 #[soroban_sdk::contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -351,7 +403,7 @@ pub struct ProposalVetoedEvent {
     pub proposal_id: u64,
     pub vetoed_by: soroban_sdk::Address,
     pub vetoed_at: u64,
-    pub reason_hash: soroban_sdk::String,
+    pub reason: soroban_sdk::String,
 }
 
 /// Emit a ProposalVetoed event when the Security Council vetoes a proposal.
@@ -361,7 +413,7 @@ pub struct ProposalVetoedEvent {
 /// * `proposal_id` - ID of the proposal that was vetoed
 /// * `vetoed_by` - Address of the Security Council that performed the veto
 /// * `vetoed_at` - Ledger timestamp of the veto
-/// * `reason` - Audit reason string (hashed in event for transparency)
+/// * `reason` - Audit reason string
 pub fn emit_proposal_vetoed(
     env: &Env,
     proposal_id: u64,
@@ -369,18 +421,18 @@ pub fn emit_proposal_vetoed(
     vetoed_at: u64,
     reason: soroban_sdk::String,
 ) -> Result<(), ContractError> {
-    let proposal_id_sym = soroban_sdk::Symbol::new(env, &format!("prop_{}", proposal_id));
+    let proposal_id_sym = symbol_short!("proposal");
     
     let event = ProposalVetoedEvent {
         proposal_id,
         vetoed_by: vetoed_by.clone(),
         vetoed_at,
-        reason_hash: reason,
+        reason,
     };
     
     emit_simple3(
         env,
-        EV_PROPOSAL_VETOED,
+        Symbol::new(env, "ProposalVetoed"),
         proposal_id_sym,
         symbol_short!("vetoed"),
         event,
@@ -415,7 +467,7 @@ pub fn emit_proposal_created(
     ipfs_cid: soroban_sdk::Bytes,
     created_at: u64,
 ) -> Result<(), ContractError> {
-    let proposal_id_sym = soroban_sdk::Symbol::new(env, &format!("prop_{}", proposal_id));
+    let proposal_id_sym = symbol_short!("prop_id");
     
     let event = ProposalCreatedEvent {
         proposal_id,
@@ -431,6 +483,19 @@ pub fn emit_proposal_created(
         proposal_id_sym,
         event,
     )
+}
+
+/// Emit a VaultDeleveraged event when a distressed vault is auto-deleveraged.
+pub fn emit_vault_deleveraged(
+    env: &Env,
+    event: crate::vaults::liquidation::VaultDeleveragedEvent,
+) {
+    let _ = emit_simple2(
+        env,
+        EV_VAULT_DELEVERAGED,
+        symbol_short!("deleverag"),
+        event,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +615,8 @@ mod tests {
 
     #[test]
     fn event_names_are_distinct() {
-        let mut seen = soroban_sdk::Map::<Symbol, ()>::new(&Env::default());
+        let env = Env::default();
+        let mut seen = soroban_sdk::Map::<Symbol, ()>::new(&env);
         let names = [
             EV_PRICE_UPDATE,
             EV_PRICE_FLOOR_SET,
@@ -586,8 +652,9 @@ mod tests {
             EV_BALLOT_OPENED,
             EV_BALLOT_CLOSED,
             EV_REMITTANCE_FEES_ROUTED,
-            EV_PROPOSAL_VETOED,
+            Symbol::new(&env, "ProposalVetoed"),
             EV_ZK_BATCH_COMMIT,
+            EV_VAULT_DELEVERAGED,
         ];
         for name in names.iter() {
             assert!(

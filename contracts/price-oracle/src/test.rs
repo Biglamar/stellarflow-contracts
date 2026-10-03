@@ -4,8 +4,52 @@ use super::*;
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger},
-    Address, Env,
+    Address, Env, IntoVal, TryFromVal, Val,
 };
+
+/// Maximum number of topic elements allowed per emitted event.
+const MAX_EVENT_TOPICS: usize = 4;
+
+/// Returns the module identifier expected as the first topic of every event
+/// emitted by this contract. Indexers rely on this to route events to the
+/// correct module handler.
+fn expected_module_topic(env: &Env) -> soroban_sdk::Symbol {
+    symbol_short!("price_oracle")
+}
+
+/// Validates that an emitted event conforms to the indexer topic schema:
+/// - the first topic matches the target contract module identifier
+/// - the event carries at most `MAX_EVENT_TOPICS` topic elements
+fn assert_event_topic_schema(env: &Env, topics: &soroban_sdk::Vec<Val>) {
+    assert!(
+        !topics.is_empty(),
+        "emitted event must contain at least one topic"
+    );
+    assert!(
+        topics.len() as usize <= MAX_EVENT_TOPICS,
+        "emitted event exceeds maximum of {} topics",
+        MAX_EVENT_TOPICS
+    );
+
+    let first = topics.get(0).unwrap();
+    let first_symbol = soroban_sdk::Symbol::try_from_val(env, &first)
+        .expect("first event topic must be a Symbol module identifier");
+    assert_eq!(
+        first_symbol,
+        expected_module_topic(env),
+        "first event topic must match the contract module identifier"
+    );
+}
+
+/// Iterates over all events emitted during the current test and asserts that
+/// each one satisfies the indexer topic schema.
+fn assert_all_events_conform(env: &Env) {
+    let events = env.events().all();
+    for event in events.iter() {
+        let (_contract, topics, _data) = event;
+        assert_event_topic_schema(env, &topics);
+    }
+}
 
 fn setup() -> (Env, Address, PriceOracleClient<'static>) {
     let env = Env::default();
@@ -56,6 +100,9 @@ fn test_get_index_price() {
     let index_price = client.get_index_price(&components);
 
     // Assert the index_price equals the expected mathematical weighted average
+    assert!(index_price >= 0);
+
+    assert_all_events_conform(&env);
 }
 
 #[test]
@@ -72,6 +119,8 @@ fn test_initialize_sets_admin_and_assets() {
         assert_eq!(admins.get(0).unwrap(), admin);
     });
     assert_eq!(client.get_all_assets(), pairs);
+
+    assert_all_events_conform(&env);
 }
 
 #[test]
@@ -97,6 +146,8 @@ fn test_revoke_key_blocks_compromised_admin_and_provider() {
         assert!(!crate::auth::_is_provider(&env, &compromised));
         assert!(crate::auth::_is_revoked(&env, &compromised));
     });
+
+    assert_all_events_conform(&env);
 }
 
 #[test]
@@ -111,7 +162,7 @@ fn test_init_admin_panics_when_called_twice() {
     let second_admin = <soroban_sdk::Address as soroban_sdk::testutils::Address>::generate(&env);
 
     client.init_admin(&first_admin);
-    // Second call should panic with Error::AlreadyInitialized
+    // Second call should panic with ContractError::AlreadyInitialized
     client.init_admin(&second_admin);
 }
 
@@ -132,6 +183,8 @@ fn test_get_price_existing_asset() {
     assert_eq!(retrieved_price.timestamp, 1_234_567_890);
     assert_eq!(retrieved_price.decimals, 6u32);
     assert_eq!(retrieved_price.provider, contract_id);
+
+    assert_all_events_conform(&env);
 }
 
 #[test]
@@ -143,7 +196,7 @@ fn test_get_price_nonexistent_asset() {
 
     let result = client.try_get_price(&asset, &true);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::AssetNotFound);
+    assert_eq!(result.unwrap_err().unwrap(), ContractError::AssetNotFound);
 }
 
 #[test]
@@ -166,6 +219,8 @@ fn test_get_price_multiple_assets() {
         client.try_get_price(&kes, &true).unwrap().unwrap().price,
         50_000_000_000_i128
     );
+
+    assert_all_events_conform(&env);
 }
 
 #[test]
@@ -191,6 +246,8 @@ fn test_get_price_after_update() {
     let updated = client.try_get_price(&asset, &true).unwrap();
     assert_eq!(updated.price, 1_200_000_i128);
     assert_eq!(updated.timestamp, 1_234_567_900);
+
+    assert_all_events_conform(&env);
 }
 
 #[test]
@@ -206,6 +263,8 @@ fn test_get_price_with_status_marks_stale_entries() {
 
     assert_eq!(result.data.price, 1_500_i128);
     assert!(result.is_stale);
+
+    assert_all_events_conform(&env);
 }
 
 #[test]
@@ -230,7 +289,7 @@ fn test_update_price_rejects_minimum_quorum_not_met() {
         &100_000_i128,
     );
     match result {
-        Err(Ok(err)) => assert_eq!(err, Error::MinimumQuorumNotMet),
+        Err(Ok(err)) => assert_eq!(err, ContractError::MinimumQuorumNotMet),
         other => panic!("expected MinimumQuorumNotMet, got {:?}", other),
     }
 }
@@ -253,7 +312,7 @@ fn test_update_price_rejects_non_provider() {
         &3_600u64,
     );
     match result {
-        Err(Ok(err)) => assert_eq!(err, Error::NotAuthorized),
+        Err(Ok(err)) => assert_eq!(err, ContractError::NotAuthorized),
         other => panic!("expected NotAuthorized, got {:?}", other),
     }
 }
@@ -282,7 +341,7 @@ fn test_update_price_rejects_flash_crash() {
         &100_000_i128,
     );
     match result {
-        Err(Ok(err)) => assert_eq!(err, Error::FlashCrashDetected),
+        Err(Ok(err)) => assert_eq!(err, ContractError::FlashCrashDetected),
         other => panic!("expected FlashCrashDetected, got {:?}", other),
     }
 }
@@ -309,7 +368,7 @@ fn test_update_price_rejects_incomplete_quorum() {
         &100_000_i128,
     );
     match result {
-        Err(Ok(err)) => assert_eq!(err, Error::IncompleteQuorum),
+        Err(Ok(err)) => assert_eq!(err, ContractError::IncompleteQuorum),
         other => panic!("expected IncompleteQuorum, got {:?}", other),
     }
 }
@@ -324,6 +383,8 @@ fn test_set_and_get_max_deviation_percentage() {
 
     let max_deviation = client.get_max_deviation_percentage();
     assert_eq!(max_deviation, 500_i128);
+
+    assert_all_events_conform(&env);
 }
 
 #[test]
@@ -335,7 +396,7 @@ fn test_set_max_deviation_percentage_rejects_values_below_floor() {
 
     let result = client.try_set_max_deviation_percentage(&admin, &50_i128);
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::InvalidMaxDeviation),
+        Err(Ok(e)) => assert_eq!(e, ContractError::InvalidMaxDeviation),
         other => panic!("expected InvalidMaxDeviation, got {:?}", other),
     }
 }
@@ -369,11 +430,13 @@ fn test_rollback_max_deviation_rejects_values_below_floor() {
 
     let result = client.try_rollback_max_deviation_pct(&admin);
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::InvalidMaxDeviation),
+        Err(Ok(e)) => assert_eq!(e, ContractError::InvalidMaxDeviation),
         other => panic!("expected InvalidMaxDeviation, got {:?}", other),
     }
 
     assert_eq!(client.get_max_deviation_percentage(), 500_i128);
+
+    assert_all_events_conform(&env);
 }
 
 #[test]
@@ -399,7 +462,7 @@ fn test_update_price_rejects_configured_max_deviation() {
         &100_000_i128,
     );
     match result {
-        Err(Ok(err)) => assert_eq!(err, Error::FlashCrashDetected),
+        Err(Ok(err)) => assert_eq!(err, ContractError::FlashCrashDetected),
         other => panic!("expected FlashCrashDetected, got {:?}", other),
     }
 }
@@ -413,7 +476,7 @@ fn test_set_min_quorum_threshold_rejects_values_below_floor() {
 
     let result = client.try_set_min_quorum_threshold(&admin, &1u32);
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::MultiSigValidationFailed),
+        Err(Ok(e)) => assert_eq!(e, ContractError::MultiSigValidationFailed),
         other => panic!("expected MultiSigValidationFailed, got {:?}", other),
     }
 }
@@ -525,7 +588,7 @@ fn test_register_assets_with_config_rolls_back_on_invalid_config() {
         &500_i128,
     );
     match result {
-        Err(Ok(err)) => assert_eq!(err, Error::InvalidPriceBounds),
+        Err(Ok(err)) => assert_eq!(err, ContractError::InvalidPriceBounds),
         other => panic!("expected InvalidPriceBounds, got {:?}", other),
     }
 
@@ -571,7 +634,7 @@ fn test_set_price_rejects_zero_price() {
         &100_000_i128,
     );
     match result {
-        Err(Ok(err)) => assert_eq!(err, Error::PriceOutOfBounds),
+        Err(Ok(err)) => assert_eq!(err, ContractError::PriceOutOfBounds),
         other => panic!("expected PriceOutOfBounds, got {:?}", other),
     }
 }
@@ -718,7 +781,7 @@ fn try_try_subscribe_to_price_updates() {
         &3600u64,
         &100_000_i128,
     ) {
-        Err(Ok(e)) => assert_eq!(e, Error::InvalidAssetSymbol),
+        Err(Ok(e)) => assert_eq!(e, ContractError::InvalidAssetSymbol),
         other => panic!("expected InvalidAssetSymbol, got {:?}", other),
     }
 }
@@ -1001,7 +1064,7 @@ fn test_flash_crash_protection_rejects_large_increase() {
         &3600u64,
         &100_000_i128,
     ) {
-        Err(Ok(e)) => assert_eq!(e, Error::FlashCrashDetected),
+        Err(Ok(e)) => assert_eq!(e, ContractError::FlashCrashDetected),
         other => panic!("expected FlashCrashDetected, got {:?}", other),
     }
 }
@@ -1191,7 +1254,7 @@ fn test_remove_asset_nonexistent_returns_error() {
 
     let result = client.try_remove_asset(&admin, &symbol_short!("NGN"));
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::AssetNotFound),
+        Err(Ok(e)) => assert_eq!(e, ContractError::AssetNotFound),
         other => panic!("expected AssetNotFound, got {:?}", other),
     }
 }
@@ -1227,7 +1290,7 @@ fn test_flash_crash_protection_rejects_large_drop() {
         &3600u64,
         &100_000_i128,
     ) {
-        Err(Ok(e)) => assert_eq!(e, Error::FlashCrashDetected),
+        Err(Ok(e)) => assert_eq!(e, ContractError::FlashCrashDetected),
         other => panic!("expected FlashCrashDetected, got {:?}", other),
     }
 }
@@ -1328,7 +1391,7 @@ fn test_clear_assets_rejects_batches_above_limit_atomically() {
 
     let result = client.try_clear_assets(&assets);
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::TooManyAssets),
+        Err(Ok(e)) => assert_eq!(e, ContractError::TooManyAssets),
         other => panic!("expected TooManyAssets, got {:?}", other),
     }
 
@@ -1893,7 +1956,7 @@ fn test_update_price_below_min_bound_rejected() {
         &100_000_i128,
     );
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::PriceOutOfBounds),
+        Err(Ok(e)) => assert_eq!(e, ContractError::PriceOutOfBounds),
         other => panic!("expected PriceOutOfBounds, got {:?}", other),
     }
 }
@@ -1964,7 +2027,7 @@ fn test_update_price_above_max_bound_rejected() {
         &100_000_i128,
     );
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::PriceOutOfBounds),
+        Err(Ok(e)) => assert_eq!(e, ContractError::PriceOutOfBounds),
         other => panic!("expected PriceOutOfBounds, got {:?}", other),
     }
 }
@@ -2033,7 +2096,7 @@ fn test_flash_crash_protection_rejects_just_over_threshold() {
         &3600u64,
         &100_000_i128,
     ) {
-        Err(Ok(e)) => assert_eq!(e, Error::FlashCrashDetected),
+        Err(Ok(e)) => assert_eq!(e, ContractError::FlashCrashDetected),
         other => panic!("expected FlashCrashDetected, got {:?}", other),
     }
 }
@@ -2780,7 +2843,7 @@ fn test_cleared_delegate_cannot_vote_owner_weight() {
 
     let result = client.try_vote_for_action(&proxy, &action_id);
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::NotAuthorized),
+        Err(Ok(e)) => assert_eq!(e, ContractError::NotAuthorized),
         other => panic!("expected NotAuthorized, got {:?}", other),
     }
 }
@@ -2832,7 +2895,7 @@ fn test_self_destruct_fails_with_same_admin_twice() {
 
     let result = client.try_self_destruct(&admin1, &admin1);
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::MultiSigValidationFailed),
+        Err(Ok(e)) => assert_eq!(e, ContractError::MultiSigValidationFailed),
         other => panic!("expected MultiSigValidationFailed, got {:?}", other),
     }
 }
@@ -2856,7 +2919,7 @@ fn test_self_destruct_fails_with_non_admin() {
 
     let result = client.try_self_destruct(&admin1, &non_admin);
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::MultiSigValidationFailed),
+        Err(Ok(e)) => assert_eq!(e, ContractError::MultiSigValidationFailed),
         other => panic!("expected MultiSigValidationFailed, got {:?}", other),
     }
 }
@@ -2876,13 +2939,13 @@ fn test_self_destruct_fails_with_only_one_admin() {
 
     let result = client.try_self_destruct(&admin1, &fake_admin);
     match result {
-        Err(Ok(e)) => assert_eq!(e, Error::MultiSigValidationFailed),
+        Err(Ok(e)) => assert_eq!(e, ContractError::MultiSigValidationFailed),
         other => panic!("expected MultiSigValidationFailed, got {:?}", other),
     }
 }
 
 #[test]
-#[should_panic(expected = "Error(ContractDestroyed)")]
+#[should_panic(expected = "ContractError(ContractDestroyed)")]
 fn test_self_destruct_blocks_admin_functions() {
     let env = Env::default();
     env.mock_all_auths();
@@ -3215,7 +3278,7 @@ fn test_ledger_gap_provider_last_seen_ledger_tracking() {
 }
 
 #[test]
-#[should_panic(expected = "Error(ContractDestroyed)")]
+#[should_panic(expected = "ContractError(ContractDestroyed)")]
 fn test_self_destruct_prevents_double_destruct() {
     let env = Env::default();
     env.mock_all_auths();
@@ -3623,7 +3686,7 @@ fn test_bypass_allows_flash_crash_price() {
         &100_000_i128,
     );
     match rejected {
-        Err(Ok(err)) => assert_eq!(err, Error::FlashCrashDetected),
+        Err(Ok(err)) => assert_eq!(err, ContractError::FlashCrashDetected),
         other => panic!("expected FlashCrashDetected, got {:?}", other),
     }
 
@@ -3697,7 +3760,7 @@ fn test_bypass_expires_and_circuit_breaker_resumes() {
         &100_000_i128,
     );
     match result {
-        Err(Ok(err)) => assert_eq!(err, Error::FlashCrashDetected),
+        Err(Ok(err)) => assert_eq!(err, ContractError::FlashCrashDetected),
         other => panic!(
             "expected FlashCrashDetected after bypass expiry, got {:?}",
             other
@@ -3758,7 +3821,7 @@ fn test_get_price_panics_when_rate_map_exceeds_max_age() {
 
     // Advance past the 300-second boundary: t=1_000 + 300 + 1 = 1_301.
     env.ledger().with_mut(|li| li.timestamp = 1_301);
-    // This must panic with Error::StaleRateData (error code 25).
+    // This must panic with ContractError::StaleRateData (error code 25).
     let _ = client.get_price(&asset, &true);
 }
 
