@@ -351,6 +351,9 @@ impl ContractError {
     pub const HarvestSwapFailed: Self = Self::RouteExecutionFailed;
     pub const HarvestSlippageExceeded: Self = Self::SlippageExceeded;
     pub const HarvestInvalidPath: Self = Self::InconsistentRouteAssets;
+    pub const StrategyInvalidPairToken: Self = Self::InvalidAsset;
+    pub const StrategyInvalidReserves: Self = Self::InsufficientLiquidityDepth;
+    pub const StrategyYieldNotPositive: Self = Self::AmountTooLow;
 
     // ── Auto-compounding yield drawdown guard (Issue #1010) ────────────────
     // Semantic aliases only, matching the `Harvest*` convention above. No new
