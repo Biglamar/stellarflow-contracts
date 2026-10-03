@@ -47,8 +47,7 @@ enum DataKey {
 #[repr(u32)]
 pub enum ContractError {
     /// The nullifier has already been recorded — this note was already withdrawn.
-    /// Recovery steps: Inspect the state for AlreadySpent and retry with valid inputs or proper conditions.
-    AlreadySpent = 1,
+    NullifierAlreadySpent = 1,
     /// The supplied ZK proof did not verify against the nullifier/public inputs.
     /// Recovery steps: Inspect the state for InvalidProof and retry with valid inputs or proper conditions.
     InvalidProof = 2,
@@ -156,7 +155,7 @@ mod spent_tree {
         }
 
         if &spent_root == current_root {
-            return Err(ContractError::AlreadySpent);
+            return Err(ContractError::NullifierAlreadySpent);
         }
         if &empty_root != current_root {
             return Err(ContractError::InvalidMerkleProof);
@@ -184,7 +183,7 @@ mod verifier {
         spent_path: &Vec<BytesN<32>>,
     ) -> Result<BytesN<32>, ContractError> {
         if storage::is_spent(env, nullifier) {
-            return Err(ContractError::AlreadySpent);
+            return Err(ContractError::NullifierAlreadySpent);
         }
 
         let updated_spent_root = spent_tree::verify_unspent_and_compute_root(
@@ -304,7 +303,7 @@ mod tests {
         assert!(storage::is_spent(&env, &nf));
         assert_eq!(
             spent_tree::verify_unspent_and_compute_root(&env, &nf, &path, &updated_root),
-            Err(ContractError::AlreadySpent)
+            Err(ContractError::NullifierAlreadySpent)
         );
     }
 
