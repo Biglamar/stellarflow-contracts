@@ -1332,6 +1332,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "stellarflow-benchmarks"
+version = "0.0.0"
+dependencies = [
+ "soroban-sdk",
+ "stellarflow-contracts",
+]
+
+[[package]]
 name = "stellarflow-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1340,6 +1348,7 @@ dependencies = [
  "libm",
  "soroban-sdk",
  "soroban-token-sdk",
+ "stellarflow-contracts",
 ]
 
 [[package]]

@@ -1,3 +1,4 @@
+pub mod compression;
 pub mod events;
 pub mod liquidity;
 pub mod swaps;

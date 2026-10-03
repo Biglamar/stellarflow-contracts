@@ -115,7 +115,7 @@ pub struct TickIndexMeta {
     /// Current tick — the tick closest to the active price.
     pub current_tick: i32,
     /// Active liquidity (sum of liquidity_net for all ticks below current).
-    pub active_liquidity: u64,
+    pub active_liquidity: u128,
     /// Number of initialized ticks.
     pub tick_count: u32,
 }
@@ -126,9 +126,9 @@ pub struct TickIndexMeta {
 pub struct TickData {
     /// Net liquidity delta applied when price crosses this tick upward.
     /// Positive = liquidity added going right; negative = liquidity removed.
-    pub liquidity_net: i64,
+    pub liquidity_net: i128,
     /// Total liquidity referencing this tick (absolute, both sides).
-    pub liquidity_gross: u64,
+    pub liquidity_gross: u128,
 }
 
 /// Result of executing a swap across tick boundaries.
@@ -276,7 +276,7 @@ pub fn place_liquidity(
 
     // ── Atomic update of gross liquidity ────────────────────────────────
     if liquidity_delta > 0 {
-        let delta = liquidity_delta as u64;
+        let delta = liquidity_delta as u128;
         tick_data.liquidity_gross = tick_data
             .liquidity_gross
             .checked_add(delta)
@@ -286,7 +286,7 @@ pub fn place_liquidity(
             .checked_add(delta)
             .ok_or(ContractError::Overflow)?;
     } else if liquidity_delta < 0 {
-        let delta = (-liquidity_delta) as u64;
+        let delta = (-liquidity_delta) as u128;
         tick_data.liquidity_gross = tick_data
             .liquidity_gross
             .checked_sub(delta)
@@ -300,7 +300,7 @@ pub fn place_liquidity(
     // ── Atomic update of net liquidity ──────────────────────────────────
     tick_data.liquidity_net = tick_data
         .liquidity_net
-        .checked_add(liquidity_delta)
+        .checked_add(liquidity_delta as i128)
         .ok_or(ContractError::Overflow)?;
 
     // ── Update sorted tick list if this tick became initialized ──────────
@@ -367,10 +367,8 @@ fn remove_tick_sorted(list: &mut Vec<i32>, tick: i32) {
 /// Returns `DEFAULT_FEE_TIER` if the pool has no explicitly configured tier.
 pub fn get_pool_fee_tier(env: &Env, asset: AssetId) -> u16 {
     let key = FeeTierKey(asset);
-    env.storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(DEFAULT_FEE_TIER)
+    let tier: u32 = env.storage().persistent().get(&key).unwrap_or(DEFAULT_FEE_TIER as u32);
+    tier as u16
 }
 
 /// Update a pool's swap fee tier. In production this is called by governance
@@ -381,7 +379,7 @@ pub fn set_pool_fee_tier(env: &Env, asset: AssetId, fee_tier: u16) -> Result<u16
         return Err(ContractError::Overflow);
     }
     let key = FeeTierKey(asset);
-    env.storage().persistent().set(&key, &fee_tier);
+    env.storage().persistent().set(&key, &(fee_tier as u32));
     Ok(fee_tier)
 }
 
@@ -766,7 +764,7 @@ pub fn tick_count(env: &Env, asset: AssetId) -> Result<u32, ContractError> {
 /// Return the current active liquidity for a pool.
 pub fn active_liquidity(env: &Env, asset: AssetId) -> Result<u64, ContractError> {
     let meta = get_tick_index(env, asset)?;
-    Ok(meta.active_liquidity)
+    Ok(meta.active_liquidity as u64)
 }
 
 /// Return the sorted list of initialized tick indices. Useful for off-chain
@@ -1245,12 +1243,14 @@ mod tests {
 
     #[test]
     fn tick_negative_inverts() {
+
         let pos = tick_to_price(10).unwrap();
         let neg = tick_to_price(-10).unwrap();
         // pos * neg ≈ PRICE_SCALE^2 (within rounding error)
         let product = pos * neg / PRICE_SCALE;
         assert!(product >= PRICE_SCALE - 1 && product <= PRICE_SCALE + 1);
-    }
+    
+}
 
     // ── Integer sqrt tests ─────────────────────────────────────────────
 
@@ -1339,13 +1339,18 @@ mod tests {
     #[test]
     fn initialize_tick_index_success() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         let meta = initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
         assert_eq!(meta.asset, asset);
         assert_eq!(meta.tick_spacing, STABLE_TICK_SPACING);
         assert_eq!(meta.tick_count, 0);
         assert_eq!(meta.active_liquidity, 0);
-    }
+    
+
+});}
 
     #[test]
     fn initialize_tick_index_rejects_zero_spacing() {
@@ -1368,19 +1373,27 @@ mod tests {
     #[test]
     fn initialize_tick_index_rejects_duplicate() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, STABLE_TICK_SPACING).unwrap();
         assert_eq!(
             initialize_tick_index(&env, asset, STABLE_TICK_SPACING),
             Err(ContractError::TickIndexAlreadyExists)
         );
-    }
+    
+
+});}
 
     // ── Liquidity placement tests ──────────────────────────────────────
 
     #[test]
     fn place_liquidity_adds_to_tick() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, 10).unwrap();
 
@@ -1391,11 +1404,16 @@ mod tests {
         let meta = get_tick_index(&env, asset).unwrap();
         assert_eq!(meta.active_liquidity, 1000);
         assert_eq!(meta.tick_count, 1);
-    }
+    
+
+});}
 
     #[test]
     fn place_liquidity_removes_from_tick() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, 10).unwrap();
 
@@ -1406,11 +1424,16 @@ mod tests {
 
         let meta = get_tick_index(&env, asset).unwrap();
         assert_eq!(meta.active_liquidity, 500);
-    }
+    
+
+});}
 
     #[test]
     fn place_liquidity_full_removal_cleans_tick() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, 10).unwrap();
 
@@ -1420,11 +1443,16 @@ mod tests {
         let meta = get_tick_index(&env, asset).unwrap();
         assert_eq!(meta.tick_count, 0);
         assert_eq!(meta.active_liquidity, 0);
-    }
+    
+
+});}
 
     #[test]
     fn place_liquidity_rejects_unaligned_tick() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, 10).unwrap();
 
@@ -1432,11 +1460,16 @@ mod tests {
             place_liquidity(&env, asset, 5, 1000),
             Err(ContractError::TickNotAligned)
         );
-    }
+    
+
+});}
 
     #[test]
     fn place_liquidity_rejects_out_of_bounds() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, 1).unwrap();
 
@@ -1444,7 +1477,9 @@ mod tests {
             place_liquidity(&env, asset, MAX_TICK_INDEX + 1, 1000),
             Err(ContractError::TickOutOfBounds)
         );
-    }
+    
+
+});}
 
     // ── Sorted list insertion tests ─────────────────────────────────────
 
@@ -1490,6 +1525,9 @@ mod tests {
     #[test]
     fn find_next_tick_up_from_below_all() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, 1).unwrap();
         place_liquidity(&env, asset, -10, 500).unwrap();
@@ -1497,11 +1535,16 @@ mod tests {
 
         let next = find_next_initialized_tick(&env, asset, -20, true).unwrap();
         assert_eq!(next, Some(-10));
-    }
+    
+
+});}
 
     #[test]
     fn find_next_tick_up_from_exactly_on_tick() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, 1).unwrap();
         place_liquidity(&env, asset, 0, 500).unwrap();
@@ -1509,11 +1552,16 @@ mod tests {
 
         let next = find_next_initialized_tick(&env, asset, 0, true).unwrap();
         assert_eq!(next, Some(0));
-    }
+    
+
+});}
 
     #[test]
     fn find_next_tick_down() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, 1).unwrap();
         place_liquidity(&env, asset, -10, 500).unwrap();
@@ -1521,17 +1569,24 @@ mod tests {
 
         let next = find_next_initialized_tick(&env, asset, 5, false).unwrap();
         assert_eq!(next, Some(-10));
-    }
+    
+
+});}
 
     #[test]
     fn find_next_tick_returns_none_when_empty() {
         let env = Env::default();
+let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+env.as_contract(&cid, || {
+
         let asset: AssetId = 1;
         initialize_tick_index(&env, asset, 1).unwrap();
 
         let next = find_next_initialized_tick(&env, asset, 0, true).unwrap();
         assert_eq!(next, None);
-    }
+    
+
+});}
 
     // ── Range efficiency tests ──────────────────────────────────────────
 
@@ -1718,3 +1773,5 @@ pub fn profile_batch_swap_allocations(
         storage_rent_within_ceiling,
     })
 }
+
+
