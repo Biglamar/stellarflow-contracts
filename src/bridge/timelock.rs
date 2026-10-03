@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Env, Vec, BytesN, Symbol};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec};
 
 use crate::ContractError;
 
@@ -7,7 +7,7 @@ pub const TIMELOCK_SECONDS: u64 = 6 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
- pub struct TimelockedWithdrawal {
+pub struct TimelockedWithdrawal {
     pub receiver: Address,
     pub amount: u128,
     pub queued_at: u64,
@@ -60,7 +60,10 @@ pub fn cancel_withdrawal(env: &Env, receiver: &Address) -> Result<(), ContractEr
     Ok(())
 }
 
-pub fn execute_withdrawal(env: &Env, receiver: &Address) -> Result<TimelockedWithdrawal, ContractError> {
+pub fn execute_withdrawal(
+    env: &Env,
+    receiver: &Address,
+) -> Result<TimelockedWithdrawal, ContractError> {
     let key = TimelockKey::Withdrawal(receiver.clone());
     let withdrawal: TimelockedWithdrawal = env
         .storage()
@@ -93,7 +96,10 @@ pub fn get_governance(env: &Env) -> Result<Address, ContractError> {
         .ok_or(ContractError::NoPendingUpgrade)
 }
 
-pub fn initialize_validator_set(env: &Env, keys: Vec<BytesN<32>>) -> Result<ValidatorSet, ContractError> {
+pub fn initialize_validator_set(
+    env: &Env,
+    keys: Vec<BytesN<32>>,
+) -> Result<ValidatorSet, ContractError> {
     let key = TimelockKey::ValidatorSet;
     if env.storage().persistent().has(&key) {
         return Err(ContractError::NoPendingUpgrade);
@@ -146,7 +152,7 @@ mod tests {
         });
         assert!(w.execute_after > w.queued_at);
         assert_eq!(
-            env.as_contract(&cid, || execute_withdrawal(&env, &receiver)),
+            execute_withdrawal(&env, &receiver),
             Err(ContractError::UpgradeTimelockNotSatisfied)
         );
     }

@@ -10,7 +10,7 @@ pub enum ProposalError {
 impl core::fmt::Display for ProposalError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ProposalError::ProposalExpired => core::write!(
+            ProposalError::ProposalExpired => write!(
                 f,
                 "Proposal expired before reaching the approval threshold"
             ),

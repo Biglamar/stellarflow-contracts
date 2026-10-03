@@ -5,48 +5,7 @@
 // It also provides helper functions for node profile management, subscription
 // rent extension, and asset price TTL management.
 use crate::NodeProfile;
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol, Vec, xdr::ToXdr};
-
-pub mod ephemeral;
-
-/// Strict 10k/100k TTL policy: extend when remaining TTL drops below the
-/// threshold, topping up to the bump amount.
-pub const THRESHOLD: u32 = 10_000;
-pub const BUMP_AMOUNT: u32 = 100_000;
-/// TTL threshold (in ledgers) applied to persistent storage entries.
-pub const PERSISTENT_TTL_THRESHOLD: u32 = 100_000;
-/// TTL target (in ledgers) applied when extending subscription entries.
-pub const RENT_THRESHOLD: u32 = 10_000;
-pub const RENT_EXTEND_TO: u32 = 100_000;
-/// TTL target (in ledgers) applied by the pre-flight asset rent check.
-pub const ASET_TTL_THRESHOLD: u32 = 100_000;
-
-pub(crate) const ADMIN_SIGNERS_KEY: Symbol = symbol_short!("ADMNSGN");
-pub(crate) const ADMIN_THRESHOLD_KEY: Symbol = symbol_short!("ADMNTHR");
-
-pub fn get_admin_signers(env: &Env) -> Vec<Address> {
-    env.storage()
-        .instance()
-        .get(&ADMIN_SIGNERS_KEY)
-        .unwrap_or_else(|| Vec::new(env))
-}
-
-pub fn set_admin_signers(env: &Env, signers: Vec<Address>) {
-    env.storage().instance().set(&ADMIN_SIGNERS_KEY, &signers);
-}
-
-pub fn get_admin_threshold(env: &Env) -> u32 {
-    env.storage()
-        .instance()
-        .get(&ADMIN_THRESHOLD_KEY)
-        .unwrap_or(1u32)
-}
-
-pub fn set_admin_threshold(env: &Env, threshold: u32) {
-    env.storage()
-        .instance()
-        .set(&ADMIN_THRESHOLD_KEY, &threshold);
-}
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Map, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,11 +99,29 @@ pub struct FeedStakeValue {
 
 /// --- Standardized TTL Helpers ---
 
+/// TTL threshold under which persistent/instance entries are bumped (~10k ledgers).
+const THRESHOLD: u32 = 10_000;
+/// TTL target applied on bump (~100k ledgers).
+const BUMP_AMOUNT: u32 = 100_000;
+
 /// Extends TTL for Persistent storage using strict 10k/100k rule.
 pub fn extend_persistent_ttl<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
     env.storage()
         .persistent()
         .extend_ttl(key, THRESHOLD, BUMP_AMOUNT);
+}
+
+/// Batch extend TTL for persistent storage entries using native extend_ttl calls
+/// up to 100,000 ledgers (or configured bounds).
+pub fn bump_persistent_batch<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val> + Clone>(env: &Env, keys: &soroban_sdk::Vec<K>) {
+    let persistent = env.storage().persistent();
+    for i in 0..keys.len() {
+        if let Some(key) = keys.get(i) {
+            if persistent.has(&key) {
+                persistent.extend_ttl(&key, 10_000, 100_000);
+            }
+        }
+    }
 }
 
 /// Extends TTL for Instance storage using strict 10k/100k rule.
@@ -295,6 +272,105 @@ impl KeyOptimizer {
             None
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Instance storage rent-expiry monitor (issue #953)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Every key held in a contract's instance storage shares one contract-wide TTL,
+// and the Soroban SDK only exposes `extend_ttl` — there is no way to read the
+// live remaining lifetime of an entry from inside a contract. The monitor
+// therefore records the ledger at which each watched instance key was last
+// refreshed and derives the remaining lifetime from that: a watch starts with a
+// full `INSTANCE_TTL_EXTEND_TO` window and loses one ledger per ledger that
+// passes.
+//
+// `check_key_ttl` is the entry point used by operators and off-chain watchers:
+// it returns the remaining lifetime and emits a `ttl_warn` event once the key
+// drops below `INSTANCE_TTL_WARNING_THRESHOLD` ledgers, so the entry can be
+// refreshed before it is evicted.
+
+/// Remaining lifetime (in ledgers) below which `check_key_ttl` raises a warning.
+pub const INSTANCE_TTL_WARNING_THRESHOLD: u32 = 10_000;
+
+/// Lifetime (in ledgers) granted to an instance-storage key when it is refreshed.
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 100_000;
+
+/// Threshold handed to `extend_ttl` when a watched key is refreshed.
+pub const INSTANCE_TTL_BUMP_THRESHOLD: u32 = INSTANCE_TTL_WARNING_THRESHOLD;
+
+/// First topic of the event emitted by `check_key_ttl` for an at-risk key.
+pub const EV_TTL_WARNING: Symbol = symbol_short!("ttl_warn");
+
+/// Tracks the ledger at which a watched instance-storage key was last refreshed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TtlMonitorKey {
+    /// (`key`) -> ledger sequence of the last refresh. The variant name stays
+    /// globally unique across the contract, as required by Soroban's key
+    /// encoding (see the module-level note at the top of this file).
+    InstanceKeyLastBump(Symbol),
+}
+
+/// Returns the ledger sequence at which `key` was last refreshed, or `None` when
+/// the key is not currently being watched.
+pub fn last_bump_ledger(env: &Env, key: Symbol) -> Option<u32> {
+    let monitor_key = TtlMonitorKey::InstanceKeyLastBump(key);
+    if env.storage().instance().has(&monitor_key) {
+        env.storage().instance().get::<_, u32>(&monitor_key)
+    } else {
+        None
+    }
+}
+
+/// Returns the remaining ledger lifetime of the watched instance-storage key
+/// `key`.
+///
+/// The value is a window estimate derived from the ledger recorded by
+/// [`refresh_key_ttl`]: the SDK does not expose the host's live TTL, so the
+/// monitor cannot report anything more precise than "ledgers left since the
+/// last refresh". A key that is not watched, or whose watch window has fully
+/// elapsed, reports `0` — callers must treat `0` as "at risk / expired".
+pub fn remaining_key_ttl(env: &Env, key: Symbol) -> u32 {
+    match last_bump_ledger(env, key) {
+        Some(last_bump) => {
+            let elapsed = env.ledger().sequence().saturating_sub(last_bump);
+            INSTANCE_TTL_EXTEND_TO.saturating_sub(elapsed)
+        }
+        None => 0,
+    }
+}
+
+/// (Re)starts the watch on the instance-storage key `key`: the contract
+/// instance TTL is extended through the host and the current ledger is recorded
+/// as the last refresh point. Returns the refreshed remaining lifetime.
+///
+/// The host only rewrites the entry's expiry when its real remaining lifetime
+/// has fallen below [`INSTANCE_TTL_BUMP_THRESHOLD`], so the returned window is an
+/// upper bound that converges on the real lifetime as the entry ages.
+pub fn refresh_key_ttl(env: &Env, key: Symbol) -> u32 {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_BUMP_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    let now = env.ledger().sequence();
+    let monitor_key = TtlMonitorKey::InstanceKeyLastBump(key);
+    env.storage().instance().set(&monitor_key, &now);
+    INSTANCE_TTL_EXTEND_TO
+}
+
+/// Returns the remaining ledger lifetime of the watched instance-storage key
+/// `key` and emits `(ttl_warn, key)` with the remaining lifetime as its payload
+/// when it falls below `INSTANCE_TTL_WARNING_THRESHOLD`.
+///
+/// The comparison is strict: an entry with exactly
+/// `INSTANCE_TTL_WARNING_THRESHOLD` ledgers left is still considered healthy.
+pub fn check_key_ttl(env: &Env, key: Symbol) -> u32 {
+    let remaining = remaining_key_ttl(env, key.clone());
+    if remaining < INSTANCE_TTL_WARNING_THRESHOLD {
+        env.events().publish((EV_TTL_WARNING, key), remaining);
+    }
+    remaining
 }
 
 /// --- Unit Tests for TTL survival (#715) ---

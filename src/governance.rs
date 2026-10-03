@@ -9,23 +9,22 @@
 
 use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol, Vec};
 
-use crate::{ContractData, ContractError, DATA_KEY, SIGNERS_KEY};
+pub(crate) use crate::governance_upgrade::*;
 
 pub(crate) const VALIDATORS_KEY: Symbol = symbol_short!("VALIDS");
 pub(crate) const VALIDATOR_SEQUENCE_KEY: Symbol = symbol_short!("VALSEQ");
+pub(crate) const BRIDGE_VALIDATORS_UPDATED_EVENT: Symbol = symbol_short!("BRVAL");
 
-#[contracttype]
-#[derive(Clone)]
-pub struct StagedUpgrade {
-    pub wasm_hash: BytesN<32>,
-    pub staged_at: u32,
-}
+use crate::{ContractData, ContractError, DATA_KEY, SIGNERS_KEY};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
 /// Minimum number of ledger sequences that must elapse between proposal
 /// submission and eligible execution.
 pub const MIN_LEDGER_DELAY: u32 = 5000;
+
+/// Approval window before an unapproved governance proposal expires: 7 days.
+pub const PROPOSAL_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 /// Storage key for the active governance proposal (only one at a time).
 pub(crate) const GOVERNANCE_PROPOSAL_KEY: Symbol = symbol_short!("GOVPROP");
@@ -37,13 +36,10 @@ pub(crate) const GOV_PROPOSAL_COUNTER_KEY: Symbol = symbol_short!("GOVCNT");
 /// to cancel a proposal during the timelock window).
 pub(crate) const GOV_CANCEL_THRESHOLD_KEY: Symbol = symbol_short!("GOVTHRSH");
 
-pub(crate) const GOVERNANCE_UPGRADE_KEY: Symbol = symbol_short!("GOVUPG");
-pub(crate) const GOVERNANCE_CONFIG_KEY: Symbol = symbol_short!("GVNCFG");
-pub(crate) const SIGNER_WEIGHTS_KEY: Symbol = symbol_short!("SIGWT");
-pub(crate) const QUORUM_WEIGHT_THRESHOLD_KEY: Symbol = symbol_short!("QWTH");
-pub(crate) const BALLOT_TTL_LEDGERS: u32 = 17_280;
-pub(crate) const BALLOT_TTL_THRESHOLD: u32 = 5_000;
-pub(crate) const PROPOSAL_TTL_SECONDS: u64 = 604_800;
+/// Storage key for the designated emergency guardian address (Issue #927).
+/// The guardian may unilaterally nullify active administrative proposals and
+/// expunge their unexecuted hashes from persistent state.
+pub(crate) const EMERGENCY_GUARDIAN_KEY: Symbol = symbol_short!("EMRG_G");
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -79,6 +75,34 @@ pub struct GovernanceProposal {
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
+
+/// Submit a governance proposal. The proposal enters a timelock period
+/// (`MIN_LEDGER_DELAY` ledger sequences) before it can be executed.
+///
+/// Only one governance proposal may be active at a time. Returns the
+/// assigned proposal ID.
+pub fn submit_governance_proposal(
+    env: &Env,
+    proposer: Address,
+    wasm_hash: BytesN<32>,
+) -> Result<u64, ContractError> {
+    // Only one active proposal at a time.
+    if env.storage().instance().has(&GOVERNANCE_PROPOSAL_KEY) {
+        let existing: GovernanceProposal = env
+            .storage()
+            .instance()
+            .get(&GOVERNANCE_PROPOSAL_KEY)
+            .unwrap();
+        if existing.status == ProposalStatus::Pending
+            || existing.status == ProposalStatus::Executable
+        {
+            return Err(ContractError::ProposalAlreadyActive);
+        }
+    }
+
+    if crate::veto::is_hash_vetoed(env, &wasm_hash) {
+        return Err(ContractError::ProposalAlreadyVetoed);
+    }
 
 /// Proposal state enumeration for governance lifecycle management.
 ///
@@ -348,6 +372,22 @@ pub fn submit_governance_proposal(
     Ok(proposal_id)
 }
 
+/// Query a governance proposal by ID.
+pub fn get_governance_proposal(
+    env: &Env,
+    proposal_id: u64,
+) -> Result<GovernanceProposal, ContractError> {
+    let proposal: GovernanceProposal = env
+        .storage()
+        .instance()
+        .get(&GOVERNANCE_PROPOSAL_KEY)
+        .ok_or(ContractError::NoActiveProposal)?;
+    if proposal.proposal_id != proposal_id {
+        return Err(ContractError::NoActiveProposal);
+    }
+    Ok(proposal)
+}
+
 /// Vote to cancel a governance proposal during its timelock window.
 ///
 /// Once the number of cancellation votes meets or exceeds the cancellation
@@ -437,6 +477,101 @@ pub fn cancel_governance_proposal(
     Ok(())
 }
 
+// ── Emergency Guardian (Issue #927) ─────────────────────────────────────────
+
+/// Return the currently designated emergency guardian, if any.
+pub fn get_emergency_guardian(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&EMERGENCY_GUARDIAN_KEY)
+}
+
+/// Designate (or rotate) the emergency guardian address.
+///
+/// Only the contract admin may designate the guardian. The guardian is a
+/// high-privilege recovery address that can nullify active administrative
+/// proposals without waiting for a multi-sig quorum.
+pub fn designate_emergency_guardian(
+    env: &Env,
+    admin: Address,
+    guardian: Address,
+) -> Result<(), ContractError> {
+    admin.require_auth();
+
+    let data: crate::ContractData = env
+        .storage()
+        .instance()
+        .get(&crate::DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
+
+    if data.admin != admin {
+        return Err(ContractError::NotAdmin);
+    }
+
+    env.storage().instance().set(&EMERGENCY_GUARDIAN_KEY, &guardian);
+
+    env.events().publish(
+        (symbol_short!("GovEmerG"),),
+        (guardian,),
+    );
+
+    Ok(())
+}
+
+/// Emergency-guardian nullification of an active administrative proposal.
+///
+/// Unlike [`vote_cancel_proposal`] (multi-sig quorum) and
+/// [`cancel_governance_proposal`] (admin-only), this entry point lets the
+/// designated emergency guardian unilaterally nullify a pending proposal and
+/// permanently **remove its unexecuted `wasm_hash` from persistent state** —
+/// before the timelock expires or at any point while it remains unexecuted.
+///
+/// # Errors
+///
+/// - [`ContractError::NotEmergencyGuardian`]             – caller is not the
+///   designated emergency guardian.
+/// - [`ContractError::NoActiveProposal`]                 – no active proposal
+///   with the given ID.
+/// - [`ContractError::ProposalAlreadyCancelledOrExecuted`] – proposal is no
+///   longer pending (already executed or cancelled).
+pub fn emergency_cancel_proposal(
+    env: &Env,
+    guardian: Address,
+    proposal_id: u64,
+) -> Result<(), ContractError> {
+    guardian.require_auth();
+
+    let designated = get_emergency_guardian(env)
+        .ok_or(ContractError::NotEmergencyGuardian)?;
+    if designated != guardian {
+        return Err(ContractError::NotEmergencyGuardian);
+    }
+
+    let mut proposal: GovernanceProposal = env
+        .storage()
+        .instance()
+        .get(&GOVERNANCE_PROPOSAL_KEY)
+        .ok_or(ContractError::NoActiveProposal)?;
+
+    if proposal.proposal_id != proposal_id {
+        return Err(ContractError::NoActiveProposal);
+    }
+
+    if proposal.status != ProposalStatus::Pending {
+        return Err(ContractError::ProposalAlreadyCancelledOrExecuted);
+    }
+
+    // Nullify the proposal and permanently free its storage slot (the
+    // `wasm_hash` and the cancellation-vote ledger live on that record).
+    proposal.status = ProposalStatus::Cancelled;
+    env.storage().instance().remove(&GOVERNANCE_PROPOSAL_KEY);
+
+    env.events().publish(
+        (symbol_short!("GovEmrCxl"), proposal_id),
+        (guardian,),
+    );
+
+    Ok(())
+}
+
 pub fn rotate_admin_keys(
     env: &Env,
     signers: &Vec<Address>,
@@ -451,7 +586,7 @@ pub fn rotate_admin_keys(
     }
 
     if new_threshold == 0 || new_threshold > signer_set.len() {
-        return Err(ContractError::InvalidThreshold);
+        return Err(ContractError::InvalidArgument);
     }
 
     let mut weights: Map<Address, u32> = Map::new(env);
@@ -466,7 +601,7 @@ pub fn rotate_admin_keys(
         .ok_or(ContractError::NotInitialized)?;
     data.admin = new_signers
         .get(0)
-        .ok_or(ContractError::InvalidThreshold)?
+        .ok_or(ContractError::InvalidArgument)?
         .clone();
 
     env.storage().instance().set(&DATA_KEY, &data);
@@ -578,7 +713,6 @@ pub struct GovernanceUpgradeProposedEvent {
     pub required_weight: u32,
     pub collected_weight: u32,
 }
-
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Verify that at least `MIN_LEDGER_DELAY` ledger sequences have elapsed
@@ -643,34 +777,11 @@ fn _next_proposal_id(env: &Env) -> u64 {
         .instance()
         .get(&GOV_PROPOSAL_COUNTER_KEY)
         .unwrap_or(0u64);
-    let next = current + 1;
+    let next = current.saturating_add(1);
     env.storage()
         .instance()
         .set(&GOV_PROPOSAL_COUNTER_KEY, &next);
     next
-}
-
-pub fn cast_vote(
-    env: &Env,
-    proposal_id: Symbol,
-    voter: Address,
-) -> Result<VotingBallot, ContractError> {
-    let key = BallotKey::Proposal(proposal_id);
-    let mut ballot: VotingBallot = env
-        .storage()
-        .temporary()
-        .get(&key)
-        .ok_or(ContractError::NoActiveProposal)?;
-    if ballot.votes.contains_key(voter.clone()) {
-        return Err(ContractError::AlreadyVoted);
-    }
-    ballot.votes.set(voter, ());
-    env.storage().temporary().set(&key, &ballot);
-    env.storage()
-        .temporary()
-        .extend_ttl(&key, BALLOT_TTL_THRESHOLD, BALLOT_TTL_LEDGERS);
-    crate::instance::bump_instance_ttl(env);
-    Ok(ballot)
 }
 
 /// Query the current governance proposal, if one exists.
@@ -709,13 +820,11 @@ fn _cancellation_threshold(env: &Env) -> u32 {
     _cancellation_threshold_for_signers(env, &crate::SIGNERS_KEY)
 }
 
-/// Return the cancellation threshold based on the current signer set
-/// stored under the given signers key.
-pub fn _cancellation_threshold_for_signers(env: &Env, signers_key: &Symbol) -> u32 {
+fn _cancellation_threshold_for_signers(env: &Env, key: &Symbol) -> u32 {
     let signers: Map<Address, ()> = env
         .storage()
         .instance()
-        .get(signers_key)
+        .get(key)
         .unwrap_or_else(|| Map::new(env));
     cancellation_threshold(signers.len())
 }
@@ -805,7 +914,7 @@ pub fn set_fee_tier(
         && new_fee_tier_bps != config.medium_fee_tier_bps
         && new_fee_tier_bps != config.high_fee_tier_bps
     {
-        return Err(ContractError::InvalidThreshold);
+        return Err(ContractError::InvalidArgument);
     }
     env.storage().instance().set(&FEE_TIER_KEY, &FeeTierConfig {
         fee_tier_bps: new_fee_tier_bps,
@@ -829,7 +938,7 @@ pub fn set_fee_split_config(
 ) -> Result<(), ContractError> {
     verify_upgrade_quorum(env, signers)?;
     if lp_share_bps.checked_add(treasury_share_bps) != Some(10000) {
-        return Err(ContractError::InvalidThreshold);
+        return Err(ContractError::InvalidArgument);
     }
     env.storage().instance().set(&FEE_SPLIT_KEY, &FeeSplitConfig {
         lp_share_bps,
@@ -980,6 +1089,98 @@ mod tests {
             result,
             Err(Ok(ContractError::ProposalAlreadyCancelledOrExecuted))
         );
+    }
+
+    // ── Emergency Guardian (Issue #927) ───────────────────────────────────
+
+    #[test]
+    fn test_designate_emergency_guardian_by_admin() {
+        let (env, client) = setup();
+        let admin = soroban_sdk::Address::generate(&env);
+        let treasury = soroban_sdk::Address::generate(&env);
+        client.initialize(&admin, &treasury);
+
+        let guardian = soroban_sdk::Address::generate(&env);
+        client.designate_emergency_guardian(&admin, &guardian);
+
+        assert_eq!(client.get_emergency_guardian(), Some(guardian));
+    }
+
+    #[test]
+    fn test_non_admin_cannot_designate_guardian() {
+        let (env, client) = setup();
+        let admin = soroban_sdk::Address::generate(&env);
+        let treasury = soroban_sdk::Address::generate(&env);
+        client.initialize(&admin, &treasury);
+
+        let outsider = soroban_sdk::Address::generate(&env);
+        let guardian = soroban_sdk::Address::generate(&env);
+        let result = client.try_designate_emergency_guardian(&outsider, &guardian);
+        assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
+    }
+
+    #[test]
+    fn test_emergency_guardian_cancels_proposal_and_removes_hash() {
+        let (env, client) = setup();
+        let admin = soroban_sdk::Address::generate(&env);
+        let treasury = soroban_sdk::Address::generate(&env);
+        client.initialize(&admin, &treasury);
+
+        let guardian = soroban_sdk::Address::generate(&env);
+        client.designate_emergency_guardian(&admin, &guardian);
+
+        let wasm_hash = make_wasm_hash(&env);
+        let proposal_id = client.submit_governance_proposal(&admin, &wasm_hash);
+
+        // The guardian nullifies the proposal before the timelock expires.
+        client.emergency_cancel_governance_proposal(&guardian, &proposal_id);
+
+        // The proposal (and with it the unexecuted wasm_hash) is fully
+        // expunged from persistent state.
+        let fetch = client.get_gov_proposal_tl(&proposal_id);
+        assert_eq!(fetch, None);
+
+        // A new proposal can be submitted immediately.
+        let id2 = client.submit_governance_proposal(&admin, &wasm_hash);
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_emergency_cancel_by_undesignated_address_fails() {
+        let (env, client) = setup();
+        let admin = soroban_sdk::Address::generate(&env);
+        let treasury = soroban_sdk::Address::generate(&env);
+        client.initialize(&admin, &treasury);
+
+        let guardian = soroban_sdk::Address::generate(&env);
+        client.designate_emergency_guardian(&admin, &guardian);
+
+        let wasm_hash = make_wasm_hash(&env);
+        let proposal_id = client.submit_governance_proposal(&admin, &wasm_hash);
+
+        // An address that is not the guardian is rejected.
+        let impostor = soroban_sdk::Address::generate(&env);
+        let result = client.try_emergency_cancel_governance_proposal(&impostor, &proposal_id);
+        assert_eq!(result, Err(Ok(ContractError::NotEmergencyGuardian)));
+
+        // The proposal is untouched.
+        let remaining = client.get_gov_proposal_tl(&proposal_id);
+        assert_eq!(remaining, Some(MIN_LEDGER_DELAY));
+    }
+
+    #[test]
+    fn test_emergency_cancel_no_guardian_designated_fails() {
+        let (env, client) = setup();
+        let admin = soroban_sdk::Address::generate(&env);
+        let treasury = soroban_sdk::Address::generate(&env);
+        client.initialize(&admin, &treasury);
+
+        let wasm_hash = make_wasm_hash(&env);
+        let proposal_id = client.submit_governance_proposal(&admin, &wasm_hash);
+
+        let stranger = soroban_sdk::Address::generate(&env);
+        let result = client.try_emergency_cancel_governance_proposal(&stranger, &proposal_id);
+        assert_eq!(result, Err(Ok(ContractError::NotEmergencyGuardian)));
     }
 
     #[test]

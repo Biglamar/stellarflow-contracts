@@ -293,16 +293,14 @@ pub fn rotate_admin_keys(
         .instance()
         .get(&DATA_KEY)
         .ok_or(ContractError::NotInitialized)?;
-    data.admin = new_signers
-        .get(0)
-        .ok_or(ContractError::InvalidThreshold)?
-        .clone();
-    env.storage().instance().set(&DATA_KEY, &data);
 
-    env.events().publish(
-        (Symbol::new(env, "AdminKeysRotated"),),
-        new_signers,
-    );
+    // Keep the legacy single-admin field aligned with the newly rotated key
+    // set so downstream `data.admin` checks keep authorizing the primary
+    // signer. `new_signers` is validated above to be non-empty.
+    if let Some(primary_signer) = new_signers.get(0) {
+        data.admin = primary_signer;
+        env.storage().instance().set(&DATA_KEY, &data);
+    }
 
     Ok(())
 }
@@ -388,6 +386,7 @@ pub fn vote_fee_tier_change(
     env.storage().instance().set(&FEE_TIER_CONFIG_KEY, &cfg);
     Ok(())
 }
+
 // ── Storage accessors ─────────────────────────────────────────────────────────
 
 /// Write the complete variance configuration to instance storage, replacing

@@ -10,11 +10,9 @@ pub use liquidity::{
 };
 pub use swaps::{publish_swap_executed, SwapExecutedEvent};
 
-use soroban_sdk::{contracttype, Env, Vec};
-
 use crate::errors::PROPOSAL_EXPIRY_SECONDS;
+use soroban_sdk::Vec;
 
-#[contracttype]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposalExpiredEvent {
     pub proposal_id: u64,
@@ -32,16 +30,10 @@ pub fn has_proposal_expired(created_at: i64, now: i64) -> bool {
     now.saturating_sub(created_at) > PROPOSAL_EXPIRY_SECONDS
 }
 
-pub fn cleanup_expired_proposals(
-    env: &Env,
-    proposals: &[(u64, i64)],
-    now: i64,
-) -> Vec<ProposalExpiredEvent> {
-    let mut expired: Vec<ProposalExpiredEvent> = Vec::new(env);
-    for (id, created_at) in proposals.iter() {
-        if has_proposal_expired(*created_at, now) {
-            expired.push_back(publish_proposal_expired(*id, now));
-        }
-    }
-    expired
+pub fn cleanup_expired_proposals(proposals: &[(i64, i64)], now: i64) -> Vec<ProposalExpiredEvent> {
+    proposals
+        .iter()
+        .filter(|(_, created_at)| has_proposal_expired(*created_at, now))
+        .map(|(id, _)| publish_proposal_expired(*id, now))
+        .collect()
 }
