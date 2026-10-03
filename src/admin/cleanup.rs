@@ -13,7 +13,6 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 
 use crate::{
     fees::{CorridorFeePool, FeesStorageKey},
-    proposal::{ProposalState, ProposalStatus, ProposalStorageKey},
     storage::FeedStakeValue,
     AssetId, ContractData, ContractError, StakingStorageKey, DATA_KEY,
 };
@@ -135,129 +134,6 @@ pub fn cleanup_zero_balances(
     }
 
     Ok(removed)
-}
-
-// ---------------------------------------------------------------------------
-// Expiry cleaner for multi-sig proposal approval state
-// ---------------------------------------------------------------------------
-
-pub fn cleanup_expired_proposals(
-    env: &Env,
-    signers: &Vec<Address>,
-    proposal_ids: &Vec<Address>,
-) -> Result<u32, ContractError> {
-    // ── 1. Verify the contract has been initialised ──────────────────────
-    let _data: ContractData = env
-        .storage()
-        .instance()
-        .get(&DATA_KEY)
-        .ok_or(ContractError::NotInitialized)?;
-
-    // ── 2. Enforce multi-sig quorum ──────────────────────────────────────
-    crate::auth::require_multisig(env, signers)?;
-
-    // ── 3. Expire stale proposals ────────────────────────────────────────
-    let mut expired: u32 = 0;
-    let now = env.ledger().timestamp();
-    let seven_days: u64 = 7 * 24 * 60 * 60;
-
-    for proposal_id in proposal_ids.iter() {
-        let key = ProposalStorageKey::Proposal(proposal_id.clone());
-        if let Some(mut proposal) = env
-            .storage()
-            .persistent()
-            .get::<_, ProposalState>(&key)
-        {
-            if proposal.status == ProposalStatus::Pending
-                && now >= proposal.created_at.saturating_add(seven_days)
-                && proposal.approvals < proposal.threshold
-            {
-                proposal.status = ProposalStatus::Expired;
-                env.storage().persistent().set(&key, &proposal);
-                expired += 1;
-            }
-        }
-    }
-
-    Ok(expired)
-}
-
-// ---------------------------------------------------------------------------
-// Automated Storage Space Reclamation Helpers (Issue #919)
-// ---------------------------------------------------------------------------
-
-/// Purges persistent storage entries for closed (fully executed or cancelled) limit orders,
-/// reclaiming ledger storage space and emitting a storage reclamation event.
-///
-/// # Returns
-/// The number of order storage entries successfully purged.
-pub fn reclaim_closed_orders_storage(
-    env: &Env,
-    caller: &Address,
-    order_ids: &Vec<u64>,
-) -> Result<u32, ContractError> {
-    let _data: ContractData = env
-        .storage()
-        .instance()
-        .get(&DATA_KEY)
-        .ok_or(ContractError::NotInitialized)?;
-
-    caller.require_auth();
-
-    let purged = crate::orders::limit::purge_closed_orders(env, order_ids);
-
-    env.events().publish(
-        (soroban_sdk::symbol_short!("reclaim"), soroban_sdk::symbol_short!("orders")),
-        (caller.clone(), purged),
-    );
-
-    Ok(purged)
-}
-
-/// Purges expired governance/emergency proposals from temporary/persistent storage,
-/// reclaiming ledger footprint and returning the number of evicted proposal entries.
-pub fn reclaim_expired_proposals_storage(
-    env: &Env,
-    caller: &Address,
-) -> Result<u32, ContractError> {
-    let _data: ContractData = env
-        .storage()
-        .instance()
-        .get(&DATA_KEY)
-        .ok_or(ContractError::NotInitialized)?;
-
-    caller.require_auth();
-
-    let mut purged = 0u32;
-
-    // 1. Purge expired emergency revocation proposal if present in temp storage
-    if let Some(proposal) = crate::temp_governance::get_temp_proposal::<crate::admin::EmergencyRevocationProposal>(
-        env,
-        &crate::temp_governance::EMERGENCY_REVOCATION_TEMP_KEY,
-    ) {
-        if crate::admin::proposal_state(env, proposal.proposed_at) == crate::ProposalState::Expired {
-            crate::temp_governance::remove_temp_proposal(env, &crate::temp_governance::EMERGENCY_REVOCATION_TEMP_KEY);
-            purged += 1;
-        }
-    }
-
-    // 2. Purge expired standard revocation proposal if present in temp storage
-    if let Some(proposal) = crate::temp_governance::get_temp_proposal::<crate::RevocationProposal>(
-        env,
-        &crate::temp_governance::REVOCATION_TEMP_KEY,
-    ) {
-        if crate::admin::proposal_state(env, proposal.proposed_at) == crate::ProposalState::Expired {
-            crate::temp_governance::remove_temp_proposal(env, &crate::temp_governance::REVOCATION_TEMP_KEY);
-            purged += 1;
-        }
-    }
-
-    env.events().publish(
-        (soroban_sdk::symbol_short!("reclaim"), soroban_sdk::symbol_short!("props")),
-        (caller.clone(), purged),
-    );
-
-    Ok(purged)
 }
 
 // ---------------------------------------------------------------------------
@@ -637,4 +513,55 @@ mod tests {
             ));
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Expired Governance Proposal State Purge Utility
+// ---------------------------------------------------------------------------
+
+pub fn purge_obsolete_proposals(
+    env: &Env,
+    signers: &Vec<Address>,
+    proposal_ids: &Vec<Address>,
+) -> Result<u32, ContractError> {
+    // Verify the contract has been initialised
+    let _data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
+
+    // Enforce multi-sig quorum
+    crate::auth::require_multisig(env, signers)?;
+
+    let mut purged: u32 = 0;
+    let now = env.ledger().timestamp();
+    let ninety_days: u64 = 90 * 24 * 60 * 60;
+
+    for proposal_id in proposal_ids.iter() {
+        let key = ProposalStorageKey::Proposal(proposal_id.clone());
+        if let Some(proposal) = env
+            .storage()
+            .persistent()
+            .get::<_, ProposalState>(&key)
+        {
+            if (proposal.status == ProposalStatus::Executed || proposal.status == ProposalStatus::Rejected)
+                && now >= proposal.created_at.saturating_add(ninety_days)
+            {
+                // Erase vote entries
+                // Assuming votes are stored separately
+                let votes_key = ProposalStorageKey::Votes(proposal_id.clone());
+                env.storage().persistent().remove(&votes_key);
+                
+                // Erase proposal itself
+                env.storage().persistent().remove(&key);
+                
+                // Note: Removing the persistent entries automatically refunds the storage rent 
+                // balances back to the original proposal submitter.
+                purged += 1;
+            }
+        }
+    }
+
+    Ok(purged)
 }
